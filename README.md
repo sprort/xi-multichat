@@ -91,6 +91,15 @@ If Japanese (or other CJK) characters show up as `?` in MultiChat, that's expect
 
 Download the [latest release](https://github.com/sprort/xi-multichat/releases/latest) (or clone this repo), copy the `multichat` folder into `Ashita/addons/`, then load with `/addon load multichat`.
 
+## Credits
+
+MultiChat's own code is original, but several techniques were verified against other approved HorizonXI addons' source before being independently implemented here, rather than guessed at blind:
+
+- **[Balloon](https://github.com/onimitch/ffxi-balloon-ashitav4)** — the NPC dialogue chat mode (150), Shout/Yell modes (10/11), the SYS chat mode (151), the synth chat mode (121, relevant to Auction House message detection), and the "Name : text" speaker-splitting technique
+- **[FishAid](https://github.com/TheAngryRogue/AshitaFishaid)** — the `text_in`-based approach to detecting fishing/craft messages, and the good/neutral/bad color mapping for fishing bite/feel messages
+- **[SimpleLog](https://github.com/Spike2D/SimpleLog)** — the live entity-data technique (SpawnFlags/PetTargetIndex) used to tell party/pets/enemies/other players apart for Combat's username coloring
+- **[GdiFonts](https://github.com/ThornyFFXI/gdifonttexture)** (ThornyFFXI) — actually bundled under `gdifonts/` (see License below) for Shift-JIS → UTF-8 conversion
+
 ## License
 
 MIT — see [LICENSE](LICENSE). `gdifonts/` is a bundled third-party dependency under its own MIT license (ThornyFFXI) — see [gdifonts/LICENSE](gdifonts/LICENSE).
