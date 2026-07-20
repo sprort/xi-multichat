@@ -90,3 +90,7 @@ If Japanese (or other CJK) characters show up as `?` in MultiChat, that's expect
 ## Installation
 
 Download the [latest release](https://github.com/sprort/xi-multichat/releases/latest) (or clone this repo), copy the `multichat` folder into `Ashita/addons/`, then load with `/addon load multichat`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). `gdifonts/` is a bundled third-party dependency under its own MIT license (ThornyFFXI) — see [gdifonts/LICENSE](gdifonts/LICENSE).
