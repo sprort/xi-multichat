@@ -19,7 +19,7 @@ local have_settings, settings = pcall(require, 'settings');
 -- renders through ImGui already and has no use for gdifonts' GDI-based font rendering.
 local have_encoding, encoding = pcall(require, 'gdifonts.encoding');
 
-print(string.format('[%s] v%s loaded. Type /multichat for options.', addon.name, addon.version));
+print(string.format('[%s] v%s loaded. Type /multichat to toggle the window (Settings are the gear icon inside it).', addon.name, addon.version));
 
 -- Chat state
 -- Per-channel history capacity. A plain array with table.remove(bucket, 1) eviction is O(n) per
@@ -407,6 +407,13 @@ local function fix_special_chars(str)
     str = str:gsub(string.char(0x81, 0x60), '~')    -- wide tilde
     str = str:gsub(string.char(0x87, 0xB2), '"')    -- left curly quote
     str = str:gsub(string.char(0x87, 0xB3), '"')    -- right curly quote
+    -- Rightwards arrow (used by Checker). Must be plain ASCII, not the real Unicode glyph:
+    -- everything fix_special_chars outputs gets fed into the general Shift-JIS -> UTF-8
+    -- conversion that runs right after it (see clean_str), and a real UTF-8 character reinter-
+    -- preted a second time AS Shift-JIS input gets corrupted into garbage -- confirmed via
+    -- in-game screenshot (rendered as "? •" instead of an arrow). Same reason the e-acute
+    -- mapping was removed from here earlier rather than left as a literal 'é'.
+    str = str:gsub(string.char(0x81, 0xA8), '->')
     return str
 end
 
@@ -509,19 +516,21 @@ end
 -- Append new message (with de-dup), possibly mark alert. `text_color`, if given, overrides the
 -- row's text color (used by Craft/Combat's message-type coloring -- see SYSTEM_MESSAGE_PATTERNS).
 -- `uname_color`, if given, overrides the row's username color (used by Combat's enemy/player
--- coloring -- see resolve_combat_uname_color). `item_span`, if given, is a {s, e} char range
--- within `msg` to highlight in ITEM_NAME_COLOR (used for item names -- see find_item_span).
+-- coloring -- see resolve_combat_uname_color). `spans`, if given, is a list of {s, e, color}
+-- char ranges within `msg`, each rendered in its own color -- used for single-span item-name
+-- highlighting (see find_item_span) and Checker's multi-segment per-piece coloring (see
+-- try_checker_message).
 -- `no_alert`, if true, skips the alert flash entirely -- used for SYS sub-categories (like
 -- auction house messages) that shouldn't trigger SYS's normal always-alert behavior.
 -- `kind`, if given, is a free-form sub-category tag stored on the row and checked at display
 -- time rather than at capture time -- used by Shout/Yell (see channel_row_visible) so that
 -- switching the Both/Shout/Yell filter can retroactively show/hide history already captured,
 -- instead of only ever affecting messages captured after the switch.
-local function append_message(channel, username, msg, is_incoming, text_color, uname_color, item_span, no_alert, kind)
+local function append_message(channel, username, msg, is_incoming, text_color, uname_color, spans, no_alert, kind)
     if is_duplicate_and_mark(channel, username, msg) then return end
     local bucket = chat.messages[channel]
     if not bucket then return end
-    bucket:push({ epoch = os.time(), username = username, message = msg, text_color = text_color, uname_color = uname_color, item_span = item_span, kind = kind })
+    bucket:push({ epoch = os.time(), username = username, message = msg, text_color = text_color, uname_color = uname_color, spans = spans, kind = kind })
     if not no_alert then
         mark_alert_if_needed(channel, msg, is_incoming)
     end
@@ -729,6 +738,137 @@ local function is_auction_house_message(line)
     return false
 end
 
+-- Checker (the official, first-party Ashita addon) prints its own /check results itself via
+-- print() with Ashita's chat color codes (see addons/Checker/checker.lua) rather than the game
+-- sending them as ordinary chat text, so there's no packet/mode to key off of -- text matching
+-- is the only option, same reasoning as Auction House messages above.
+--
+-- Colors below are checker.lua's own difficulty-tier colors, cross-referenced against Ashita's
+-- addons/libs/chat.lua color-name table (its color1() calls use the same numeric color-table
+-- indices that table names) -- Grey/LawnGreen/Coral/Salmon/Tomato/Magenta are standard CSS
+-- color values. "like a decent challenge" (index 102) has no name in that table, so it's left
+-- uncolored (falls back to SYS's default) rather than guessed at.
+local CHECKER_TIER_COLORS = {
+    { prefix = "too weak to be worthwhile", color = {128/255, 128/255, 128/255, 1.0} }, -- Grey
+    { prefix = "like easy prey",            color = {124/255, 252/255,   0/255, 1.0} }, -- LawnGreen
+    { prefix = "like an even match",        color = {255/255, 127/255,  80/255, 1.0} }, -- Coral
+    { prefix = "very tough",                color = {255/255,  99/255,  71/255, 1.0} }, -- Tomato
+    { prefix = "incredibly tough",          color = {255/255,  99/255,  71/255, 1.0} }, -- Tomato
+    { prefix = "tough",                     color = {250/255, 128/255, 114/255, 1.0} }, -- Salmon
+    { prefix = "Impossible to gauge!",      color = {255/255,   0/255, 255/255, 1.0} }, -- Magenta
+}
+
+local function checker_tier_color(body)
+    for _, t in ipairs(CHECKER_TIER_COLORS) do
+        if body:find(t.prefix, 1, true) then return t.color end
+    end
+    return nil
+end
+
+-- The rest of Checker's own coloring (name, arrow, level, brackets/parens, conditions),
+-- likewise cross-referenced against chat.lua's color-name table. Index 106 ("cream/yellow",
+-- used for the name and conditions -- also used by the conquest addon's "Unknown:" line, see
+-- try_conquest_addon_message below) has no exact named value there -- only chat.message()'s own
+-- doc comment describing it qualitatively -- so this is a reasonable pale-yellow approximation,
+-- not a byte-exact verified color like the others.
+local ASHITA_CREAM_COLOR   = {255/255, 250/255, 205/255, 1.0} -- ~cream/yellow (index 106, approximate)
+local CHECKER_AQUA_COLOR   = {  0/255, 255/255, 255/255, 1.0} -- Aqua (index 82)
+local CHECKER_PURPLE_COLOR = {153/255,  50/255, 204/255, 1.0} -- DarkOrchid (index 81)
+
+-- Returns true (and appends to SYS) if this is a Checker line, false otherwise. Rebuilds the
+-- message from its parsed pieces (name/level/verdict/conditions) rather than just passing the
+-- raw text through, so each piece can carry its own color span -- matching the native log's
+-- own per-segment coloring instead of one flat row color.
+local function try_checker_message(line)
+    local body = line:match("^%[checker%] (.+)$")
+    if not body then return false end
+
+    -- "-" is a Lua pattern magic character (lazy-repetition quantifier), so the literal "->"
+    -- arrow needs escaping as "%->" here -- unlike the plain string literal passed to push()
+    -- below, which isn't a pattern and needs no escaping.
+    local name, level, rest = body:match("^(.-) %-> %(Lv%. (.-)%) (.+)$")
+    if not name then
+        -- Unexpected format (e.g. a future Checker update) -- fall back to showing the line
+        -- as-is, uncolored, rather than silently dropping it.
+        append_message('sys', 'Checker', body, true)
+        return true
+    end
+
+    -- The verdict is followed by "(conditions)" only when the check actually returned any
+    -- (Checker's own conditions table has an empty-string entry for "no notable conditions").
+    local verdict, condition = rest:match("^(.-) %((.-)%)$")
+    if not verdict then verdict = rest end
+
+    local parts, spans, pos = {}, {}, 1
+    local function push(str, color)
+        table.insert(parts, str)
+        if color then table.insert(spans, { s = pos, e = pos + #str - 1, color = color }) end
+        pos = pos + #str
+    end
+    push(name, ASHITA_CREAM_COLOR)
+    push(' ')
+    push('->', CHECKER_AQUA_COLOR)
+    push(' (Lv. ', CHECKER_PURPLE_COLOR)
+    push(level, CHECKER_AQUA_COLOR)
+    push(')', CHECKER_PURPLE_COLOR)
+    push(' ')
+    push(verdict, checker_tier_color(verdict))
+    if condition and condition ~= '' then
+        push(' (', CHECKER_PURPLE_COLOR)
+        push(condition, ASHITA_CREAM_COLOR)
+        push(')', CHECKER_PURPLE_COLOR)
+    end
+
+    append_message('sys', 'Checker', table.concat(parts), true, nil, nil, spans)
+    return true
+end
+
+-- Server's own periodic "Conquest update:" broadcast (native text, not any addon's output) --
+-- text matching rather than mode, same reasoning as Auction House/Checker above. Requires an
+-- exact known nation name (San d'Oria/Bastok/Windurst) before "- <level>" so this can't
+-- misfire on unrelated chat formatted similarly, without needing to enumerate every possible
+-- influence-level word (Major/Minor/Minimal/etc.) FFXI might use.
+local function is_conquest_update_line(line)
+    if line == 'Conquest update:' then return true end
+    if line == 'Regional influence:' then return true end
+    if line:match("^This region is currently under .- control%.$") then return true end
+    if line:match("^San d'Oria %- %a+$") then return true end
+    if line:match("^Bastok %- %a+$") then return true end
+    if line:match("^Windurst %- %a+$") then return true end
+    return false
+end
+
+-- The "conquest" addon (official first-party Ashita addon, GPL-3.0, printed via /conquest or
+-- /regions) prints its own results itself via print(), same as Checker -- text matching, no
+-- code copied, only the message format and its own color choices referenced (see
+-- addons/conquest/conquest.lua's CONTROLLERS table, which itself cites libs/chat.lua) to
+-- independently write this. Colors are exact verified matches this time, not approximations --
+-- San d'Oria=Tomato(76), Bastok=RoyalBlue(71), Windurst=Yellow(69), Beastmen=Lime(79); the
+-- "Unknown:" bucket uses chat.message() (index 106), the same approximate cream used for
+-- Checker (see ASHITA_CREAM_COLOR above).
+local CONQUEST_NATION_COLORS = {
+    { prefix = "San d'Oria", color = {255/255,  99/255,  71/255, 1.0} }, -- Tomato
+    { prefix = "Bastok",     color = { 65/255, 105/255, 225/255, 1.0} }, -- RoyalBlue
+    { prefix = "Windurst",   color = {255/255, 255/255,   0/255, 1.0} }, -- Yellow
+    { prefix = "Beastmen",   color = {  0/255, 255/255,   0/255, 1.0} }, -- Lime
+    { prefix = "Unknown",    color = ASHITA_CREAM_COLOR },
+}
+
+local function conquest_addon_color(body)
+    for _, c in ipairs(CONQUEST_NATION_COLORS) do
+        if body:find(c.prefix, 1, true) == 1 then return c.color end
+    end
+    return nil
+end
+
+-- Returns true (and appends to SYS) if this is the conquest addon's own output, false otherwise.
+local function try_conquest_addon_message(line)
+    local body = line:match("^%[conquest%] (.+)$")
+    if not body then return false end
+    append_message('sys', 'Conquest', body, true, conquest_addon_color(body))
+    return true
+end
+
 -- Fishing bite/feel message colors -- taken directly from the approved FishAid addon's own
 -- color mapping (addons/fishaid/fishaid.lua:31-45, ARGB 0x00FF00/0x999900/0x8B0000), which
 -- matches the native game log's own coloring for these exact messages.
@@ -858,6 +998,10 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- Confirmed via in-game screenshot -- neutral outcome, same treatment as "The fish gets
     -- away." above (self_only, no explicit color -- falls back to the Craft tab's default).
     { channel = 'craft', pattern = "^You didn't catch anything%.$",                     self_only = true },
+    -- Confirmed via in-game screenshot -- shown in the native log's plain default color, not
+    -- FISH_BAD_COLOR, despite losing the catch (same treatment as "You give up and reel in
+    -- your line." above).
+    { channel = 'craft', pattern = "^Your line breaks%.$",                              self_only = true, color = ITEM_COLOR },
 }
 
 -- Best-effort pet/avatar/fellow name lookup for the "Me & Pets" filter. Party slot 0 is always
@@ -1049,12 +1193,13 @@ end
 -- Locates an already-extracted item name within the final displayed body text, so the renderer
 -- can highlight just that span (see ITEM_NAME_COLOR / draw_wrapped_colored). Plain-text find
 -- (not a pattern search) since the item name is a literal substring at this point, not itself
--- a pattern to match against.
+-- a pattern to match against. Returns a single-entry spans list (see append_message), the same
+-- shape append_message's `spans` parameter expects directly.
 local function find_item_span(body, item_name)
     if not item_name or item_name == '' then return nil end
     local s, e = body:find(item_name, 1, true)
     if not s then return nil end
-    return { s = s, e = e }
+    return { { s = s, e = e, color = ITEM_NAME_COLOR } }
 end
 
 -- Merges the Angler ability's catch-reveal ("Your keen angler's senses tell you that this is
@@ -1075,7 +1220,7 @@ local function try_merge_angler_reveal(fish)
     end
     if last.epoch ~= os.time() then return false end
     last.message = last.message .. " You sense it's a " .. fish .. '!'
-    last.item_span = find_item_span(last.message, fish)
+    last.spans = find_item_span(last.message, fish)
     return true
 end
 
@@ -1198,12 +1343,12 @@ local function process_system_line(msg)
             if msg:find(entry.pattern) then
                 local me = current_char_name()
                 local who = me ~= '' and me or 'You'
-                local item_span
+                local spans
                 if entry.item_capture then
                     local matches = { msg:match(entry.pattern) }
-                    item_span = find_item_span(msg, matches[entry.item_capture])
+                    spans = find_item_span(msg, matches[entry.item_capture])
                 end
-                append_message(entry.channel, who, msg, true, entry.color, resolve_uname_color(entry.channel, who), item_span)
+                append_message(entry.channel, who, msg, true, entry.color, resolve_uname_color(entry.channel, who), spans)
                 return
             end
         else
@@ -1215,13 +1360,13 @@ local function process_system_line(msg)
                 -- name, so the body text doesn't still start with "You" once the username
                 -- column already shows the resolved name.
                 local body = strip_actor_prefix(msg, actor)
-                local item_span = entry.item_capture and find_item_span(body, matches[entry.item_capture])
+                local spans = entry.item_capture and find_item_span(body, matches[entry.item_capture])
                 if actor:lower() == 'you' then
                     local me = current_char_name()
                     if me ~= '' then actor = me end
                 end
                 actor = strip_leading_article(actor)
-                append_message(entry.channel, actor, body, true, entry.color, resolve_uname_color(entry.channel, actor), item_span)
+                append_message(entry.channel, actor, body, true, entry.color, resolve_uname_color(entry.channel, actor), spans)
                 return
             end
         end
@@ -1354,6 +1499,12 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
                 -- item actually sold.
                 local ahItem = line:match("^Your '(.-)' has sold to .- for %d+ gil!$")
                 append_message('sys', 'Auction', line, true, AH_TEXT_COLOR, nil, find_item_span(line, ahItem), not ahItem)
+            elseif try_checker_message(line) then
+                -- Already fully handled inside try_checker_message.
+            elseif try_conquest_addon_message(line) then
+                -- Already fully handled inside try_conquest_addon_message.
+            elseif is_conquest_update_line(line) then
+                append_message('sys', 'System', line, true)
             elseif mode == NPC_DIALOGUE_MODE then
                 local name, body = parse_npc_dialogue_line(line, npc_speaker)
                 npc_speaker = name
@@ -1403,16 +1554,22 @@ end
 local braceL = {39/255, 107/255, 58/255, 1.0}   -- "{"
 local braceR = {206/255, 45/255, 49/255, 1.0}   -- "}"
 
--- `item_span`, if given ({s, e} char offsets into `text`), marks every token overlapping that
--- range with `.item = true` so draw_wrapped_colored can render it in ITEM_NAME_COLOR.
-local function tokenize_for_wrap(text, item_span)
+-- `spans`, if given, is a list of {s, e, color} char ranges within `text` -- each token that
+-- falls in one is tagged `.span_color` so draw_wrapped_colored can render it in that color
+-- instead of the row's default text color. Used both for single-span item-name highlighting
+-- (see find_item_span) and Checker's multi-segment per-piece coloring (see try_checker_message).
+-- Splits not just on spaces/braces but also at span-color boundaries, so two differently
+-- colored pieces with no space between them (e.g. Checker's "24)") still end up as separate
+-- tokens instead of being forced to share one color.
+local function tokenize_for_wrap(text, spans)
     local tokens = {}
     local i, n = 1, #text
-    local function mark(tokStart, tokEnd, tok)
-        if item_span and tokStart <= item_span.e and tokEnd >= item_span.s then
-            tok.item = true
+    local function color_at(pos)
+        if not spans then return nil end
+        for _, sp in ipairs(spans) do
+            if pos >= sp.s and pos <= sp.e then return sp.color end
         end
-        return tok
+        return nil
     end
     while i <= n do
         local ch = text:sub(i,i)
@@ -1425,16 +1582,18 @@ local function tokenize_for_wrap(text, item_span)
         elseif ch == ' ' then
             local j = i + 1
             while j <= n and text:sub(j,j) == ' ' do j = j + 1 end
-            table.insert(tokens, mark(i, j-1, {type='space', str=text:sub(i, j-1)}))
+            table.insert(tokens, {type='space', str=text:sub(i, j-1)})
             i = j
         else
+            local startColor = color_at(i)
             local j = i + 1
             while j <= n do
                 local c = text:sub(j,j)
                 if c == '{' or c == '}' or c == ' ' then break end
+                if color_at(j) ~= startColor then break end
                 j = j + 1
             end
-            table.insert(tokens, mark(i, j-1, {type='text', str=text:sub(i, j-1)}))
+            table.insert(tokens, {type='text', str=text:sub(i, j-1), span_color=startColor})
             i = j
         end
     end
@@ -1458,7 +1617,7 @@ local function layout_tokens(tokens, maxw)
         end
         if #line == 1 and curw > maxw then
             local s = line[1].str
-            local was_item = line[1].item
+            local was_span_color = line[1].span_color
             local k, acc = 1, 0.0
             while k <= #s do
                 local ch = s:sub(k,k)
@@ -1472,7 +1631,7 @@ local function layout_tokens(tokens, maxw)
             table.insert(lines, line)
             line, curw = {}, 0.0
             if #tail > 0 then
-                table.insert(line, {type='text', str=tail, item=was_item})
+                table.insert(line, {type='text', str=tail, span_color=was_span_color})
                 curw = width(tail)
             end
         end
@@ -1491,11 +1650,11 @@ local function resolve_color(setting, channel, fallback)
     return setting.all or fallback
 end
 
-local function draw_wrapped_colored(text, text_color, item_span)
+local function draw_wrapped_colored(text, text_color, spans)
     local ok, avail = pcall(imgui.GetContentRegionAvail)
     local availx = ok and get_x(avail) or 0
     if availx <= 20 then imgui.TextColored(text_color, text); return end
-    local tokens = tokenize_for_wrap(text, item_span)
+    local tokens = tokenize_for_wrap(text, spans)
     local lines = layout_tokens(tokens, availx)
     for _, line in ipairs(lines) do
         local first = true
@@ -1503,7 +1662,7 @@ local function draw_wrapped_colored(text, text_color, item_span)
             local function draw_token()
                 if t.type == 'braceL' then      imgui.TextColored(braceL, '{')
                 elseif t.type == 'braceR' then imgui.TextColored(braceR, '}')
-                elseif t.item then             imgui.TextColored(ITEM_NAME_COLOR, t.str)
+                elseif t.span_color then       imgui.TextColored(t.span_color, t.str)
                 else                            imgui.TextColored(text_color, t.str) end
             end
             if first then draw_token(); first = false else imgui.SameLine(0,0); draw_token() end
@@ -1530,12 +1689,12 @@ local function draw_colored_username(uname, ucolor)
 end
 
 -- Draw one row (copy on click + context)
-local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, item_span)
+local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, spans)
     imgui.TextColored(ts_color, timestamp); imgui.SameLine()
     draw_colored_username(uname, ucolor); imgui.SameLine(msg_col_x)
     imgui.PushID(row_id)
     imgui.BeginGroup()
-    draw_wrapped_colored(message, text_color, item_span)
+    draw_wrapped_colored(message, text_color, spans)
     imgui.EndGroup()
     local hovered = imgui.IsItemHovered()
     if hovered and imgui.IsMouseClicked(0) then pcall(function() imgui.SetClipboardText(row_full) end) end
@@ -1599,7 +1758,7 @@ local function draw_channel_messages(channel)
         -- resolve_combat_uname_color) and stored on the entry, rather than re-scanning the
         -- entity table here every frame for every visible row.
         local row_uname_color = (channel == 'combat' and entry.uname_color) or uname_color
-        draw_row(row_timestamp, entry.username, entry.message, row_uname_color, ts_color, row_text_color, row_full, idx, msg_col_x, entry.item_span)
+        draw_row(row_timestamp, entry.username, entry.message, row_uname_color, ts_color, row_text_color, row_full, idx, msg_col_x, entry.spans)
     end)
     if pushed_spacing > 0 then pcall(function() imgui.PopStyleVar(pushed_spacing) end) end
 end
