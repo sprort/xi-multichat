@@ -723,6 +723,9 @@ local function is_auction_house_message(line)
     -- a different wording from the "total transaction fee for a set of N items" message above,
     -- not just a cropped version of it.
     if line:match('^You have to pay a transaction fee of %d+ gil%.$') then return true end
+    -- Sale confirmation to the seller -- confirmed via in-game screenshot ("Your 'Moat carp'
+    -- has sold to Quesogrande for 3000 gil!").
+    if line:match("^Your '.-' has sold to .- for %d+ gil!$") then return true end
     return false
 end
 
@@ -852,6 +855,9 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- other players too ("Xenruu caught a moat carp!"), not just your own ("You caught a...").
     { channel = 'craft', pattern = "^(.-) caught (.-)!$",                item_capture = 2, color = ITEM_COLOR },
     { channel = 'craft', pattern = "^The fish gets away%.?!?$",                         self_only = true },
+    -- Confirmed via in-game screenshot -- neutral outcome, same treatment as "The fish gets
+    -- away." above (self_only, no explicit color -- falls back to the Craft tab's default).
+    { channel = 'craft', pattern = "^You didn't catch anything%.$",                     self_only = true },
 }
 
 -- Best-effort pet/avatar/fellow name lookup for the "Me & Pets" filter. Party slot 0 is always
@@ -1118,18 +1124,15 @@ end
 -- of these and has already been fully handled, false otherwise.
 local function try_broadcast_message(msg)
     if msg:match("^Achievement Unlocked:") then
-        local me = current_char_name()
-        local who = me ~= '' and me or 'You'
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
-            append_message(ch, who, msg, true, ACHIEVEMENT_COLOR, resolve_uname_color(ch, who))
+            append_message(ch, 'Achievement', msg, true, ACHIEVEMENT_COLOR)
         end
         return true
     end
 
-    local hcActor = msg:match("^★ (.-) has reached level %d+ on .- as a hardcore character! ★$")
-    if hcActor then
+    if msg:match("^★ .- has reached level %d+ on .- as a hardcore character! ★$") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
-            append_message(ch, hcActor, msg, true, ACHIEVEMENT_COLOR, resolve_uname_color(ch, hcActor))
+            append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR)
         end
         return true
     end
@@ -1340,7 +1343,17 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
                 -- says misc_message (148) covers fishing messages too, so blindly routing that
                 -- whole mode to SYS could divert real Craft fishing captures. Text matching
                 -- sidesteps needing to know the mode at all.
-                append_message('sys', 'System', line, true, AH_TEXT_COLOR, nil, nil, true)
+                -- Confirmed via diagnostic print: AH messages arrive under mode 121 (Balloon's
+                -- chat_modes.synth) -- the exact same mode as synthesis result messages, so a
+                -- mode check can't distinguish the two. Text matching stays the correct approach
+                -- here, not a workaround for an unknown mode.
+                -- Labeled "Auction" rather than "System" so it's visually distinct from actual
+                -- system broadcasts even though both share the SYS tab. Sale notifications alert
+                -- like SYS normally does (see mark_alert_if_needed); every other AH message
+                -- (listing confirmation, fees, etc.) stays silent -- less urgent than knowing an
+                -- item actually sold.
+                local ahItem = line:match("^Your '(.-)' has sold to .- for %d+ gil!$")
+                append_message('sys', 'Auction', line, true, AH_TEXT_COLOR, nil, find_item_span(line, ahItem), not ahItem)
             elseif mode == NPC_DIALOGUE_MODE then
                 local name, body = parse_npc_dialogue_line(line, npc_speaker)
                 npc_speaker = name
