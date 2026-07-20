@@ -1595,6 +1595,33 @@ end
 local function clamp01(x) if x < 0 then return 0 elseif x > 1 then return 1 else return x end end
 local function shade(c, m) return { clamp01(c[1]*m), clamp01(c[2]*m), clamp01(c[3]*m), c[4] } end
 
+-- Global accent color override for the whole addon's UI -- Ashita's default ImGui theme uses a
+-- red/orange accent for the scrollbar, window resize grip, radio button/checkbox mark, and
+-- slider handles; this re-themes those to match MultiChat's own blue title bar colors instead.
+-- Also covers plain, unstyled imgui.Button calls (e.g. Settings' "Reset" buttons). Buttons that
+-- already push their own explicit color (channel tabs, titlebar_color_button, borderless_button,
+-- etc.) are unaffected -- ImGui's style stack is LIFO, so their own push simply takes priority
+-- until it's popped, falling back to this one rather than being overridden by it.
+local function push_accent_colors()
+    local pushed = 0
+    local function push(col, color)
+        if pcall(function() imgui.PushStyleColor(col, color) end) then pushed = pushed + 1 end
+    end
+    push(ImGuiCol_CheckMark,            TITLEBAR_ACTIVE)
+    push(ImGuiCol_SliderGrab,           TITLEBAR_INACTIVE)
+    push(ImGuiCol_SliderGrabActive,     TITLEBAR_ACTIVE)
+    push(ImGuiCol_ScrollbarGrab,        TITLEBAR_INACTIVE)
+    push(ImGuiCol_ScrollbarGrabHovered, shade(TITLEBAR_INACTIVE, 1.3))
+    push(ImGuiCol_ScrollbarGrabActive,  TITLEBAR_ACTIVE)
+    push(ImGuiCol_ResizeGrip,           TITLEBAR_INACTIVE)
+    push(ImGuiCol_ResizeGripHovered,    shade(TITLEBAR_INACTIVE, 1.3))
+    push(ImGuiCol_ResizeGripActive,     TITLEBAR_ACTIVE)
+    push(ImGuiCol_Button,               TITLEBAR_INACTIVE)
+    push(ImGuiCol_ButtonHovered,        shade(TITLEBAR_INACTIVE, 1.3))
+    push(ImGuiCol_ButtonActive,         shade(TITLEBAR_INACTIVE, 0.85))
+    return pushed
+end
+
 -- Inverting flash: toggles every ~0.6s between (bg=color, text=black) and (bg=black, text=color)
 local function colored_button(label, color, invert_flash)
     local phase = math.floor(os.clock() / 0.6) % 2
@@ -1869,6 +1896,8 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     if (not okStatus) or loginStatus ~= 2 or GetPlayerEntity() == nil then return end
 
     if force_center_frames > 0 then force_center_frames = force_center_frames - 1 end
+
+    local pushed_accent = push_accent_colors()
 
     draw_settings_window()
 
@@ -2212,4 +2241,6 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         imgui.PopStyleColor(1)
         if pushed_titlebar_main > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar_main) end) end
     end
+
+    if pushed_accent > 0 then pcall(function() imgui.PopStyleColor(pushed_accent) end) end
 end)
