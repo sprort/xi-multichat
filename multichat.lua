@@ -2083,10 +2083,20 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             if imgui.Begin(title, state.is_open) then
                 apply_font_scale()
                 save_window_geom(channel)
-                local focused = false; pcall(function() focused = imgui.IsWindowFocused() end)
+                -- ImGuiFocusedFlags_ChildWindows is required here -- the message area below is
+                -- a separate BeginChild (a child window with its own focus state), and without
+                -- this flag, clicking inside it doesn't count as this outer window being
+                -- focused, so the alert would only clear when clicking the title bar/button row
+                -- specifically. Confirmed via user report: clicking the message area didn't
+                -- clear the alert, only clicking near the buttons did.
+                local focused = false; pcall(function() focused = imgui.IsWindowFocused(ImGuiFocusedFlags_ChildWindows) end)
                 if focused then pop[channel].alert = false end
                 if titlebar_color_button('Pop In') then state.popped=false; state.is_open[1]=true; pop[channel].alert=false end
-                imgui.SameLine(); if is_alerting(channel) then imgui.TextColored({1,0.4,0.4,1}, '•') end
+                -- Plain ASCII, not the "proper" bullet character -- same font-glyph-coverage
+                -- issue as the special chat characters (see fix_special_chars): "•" renders as
+                -- "?" since it's outside the loaded JP font's glyph range. Confirmed via
+                -- in-game screenshot.
+                imgui.SameLine(); if is_alerting(channel) then imgui.TextColored({1,0.4,0.4,1}, '!') end
                 imgui.SameLine(); if titlebar_color_button('Copy') then copy_all(channel) end
                 imgui.Separator()
                 -- Window background already carries the tint; keep the child transparent so it
