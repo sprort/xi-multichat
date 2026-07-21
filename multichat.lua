@@ -19,6 +19,14 @@ local have_settings, settings = pcall(require, 'settings');
 -- renders through ImGui already and has no use for gdifonts' GDI-based font rendering.
 local have_encoding, encoding = pcall(require, 'gdifonts.encoding');
 
+-- In-game update checking (see check_for_update/perform_update further down). Technique
+-- researched from the approved anglin addon's own working self-updater (addons/anglin/
+-- anglin.lua) -- no code copied, only the approach: fetch the raw .lua file straight from
+-- GitHub and regex the addon.version line out of it directly, no separate manifest/API needed.
+-- socket.ssl.https lives at the shared addons/libs/socket/ssl/https.lua, the same one anglin
+-- itself relies on -- not something either addon bundles.
+local have_https, https = pcall(require, 'socket.ssl.https');
+
 print(string.format('[%s] v%s loaded. Type /multichat to toggle the window (Settings are the gear icon inside it).', addon.name, addon.version));
 
 -- Chat state
@@ -536,6 +544,95 @@ local function append_message(channel, username, msg, is_incoming, text_color, u
     end
 end
 
+-- ===== In-game update checking =====
+-- Reports into SYS (username "MultiChat") rather than a plain /echo, so it's visible in the
+-- same history as everything else. Only an actual available update triggers SYS's normal
+-- alert -- a routine "you're current" result is logged quietly (no_alert=true) since it isn't
+-- something that needs your attention.
+local UPDATE_REPO_RAW = 'https://raw.githubusercontent.com/sprort/xi-multichat/main/'
+local UPDATE_FILES = {
+    { url = UPDATE_REPO_RAW .. 'multichat.lua',         path = addon.path:append('\\multichat.lua') },
+    { url = UPDATE_REPO_RAW .. 'README.md',             path = addon.path:append('\\README.md') },
+    { url = UPDATE_REPO_RAW .. 'LICENSE',               path = addon.path:append('\\LICENSE') },
+    { url = UPDATE_REPO_RAW .. 'gdifonts/encoding.lua', path = addon.path:append('\\gdifonts\\encoding.lua') },
+    { url = UPDATE_REPO_RAW .. 'gdifonts/LICENSE',      path = addon.path:append('\\gdifonts\\LICENSE') },
+}
+
+local function ver_gt(a, b)
+    local function parts(v)
+        local t = {}
+        for n in v:gmatch('%d+') do table.insert(t, tonumber(n)) end
+        return t
+    end
+    local pa, pb = parts(a), parts(b)
+    for i = 1, math.max(#pa, #pb) do
+        local ai, bi = pa[i] or 0, pb[i] or 0
+        if ai ~= bi then return ai > bi end
+    end
+    return false
+end
+
+-- Fetches the raw multichat.lua straight from GitHub and pulls its addon.version line back out
+-- via pattern match -- no separate version manifest/API needed. Cache-busted with a timestamp
+-- query param so GitHub's own CDN can't serve a stale response.
+local function fetch_remote_version()
+    if not have_https then return nil end
+    local ok, body, code = pcall(function() return https.request(UPDATE_REPO_RAW .. 'multichat.lua?t=' .. os.time()) end)
+    if not ok or code ~= 200 or not body then return nil end
+    return body:match("addon%.version%s*=%s*'([^']+)'") or body:match('addon%.version%s*=%s*"([^"]+)"')
+end
+
+local update_available_version = nil
+local update_check_done = false
+
+local function check_for_update()
+    local remote = fetch_remote_version()
+    if not remote then return end
+    if ver_gt(remote, addon.version) then
+        update_available_version = remote
+        append_message('sys', 'MultiChat', string.format(
+            'Update available: v%s -> v%s. Type /multichat update to install.', addon.version, remote), true)
+    else
+        append_message('sys', 'MultiChat', string.format('Up to date (v%s).', addon.version), true, nil, nil, nil, true)
+    end
+end
+
+-- Downloads every file fresh and overwrites the current install, aborting on the first failure
+-- (matching anglin's own approach) rather than leaving a half-updated mix of old and new files.
+-- Reloads automatically on success via Ashita's own /addon reload -- the file on disk is fully
+-- written and closed before that command is issued, so the reload picks up the new version
+-- cleanly rather than racing the write.
+local function perform_update()
+    if not have_https then
+        append_message('sys', 'MultiChat', 'Update failed: HTTPS library unavailable.', true, nil, nil, nil, true)
+        return
+    end
+    local remote = fetch_remote_version()
+    if not remote then
+        append_message('sys', 'MultiChat', 'Update failed: could not reach GitHub.', true, nil, nil, nil, true)
+        return
+    end
+    for _, f in ipairs(UPDATE_FILES) do
+        local ok, body, code = pcall(function() return https.request(f.url .. '?t=' .. os.time()) end)
+        if not ok or code ~= 200 or not body or body == '' then
+            append_message('sys', 'MultiChat', string.format('Update failed downloading %s -- aborted, nothing changed.', f.url), true, nil, nil, nil, true)
+            return
+        end
+        local dir = f.path:match('^(.*)\\[^\\]+$')
+        if dir then os.execute(string.format('mkdir "%s" 2>nul', dir)) end
+        local out = io.open(f.path, 'wb')
+        if not out then
+            append_message('sys', 'MultiChat', 'Update failed: cannot write ' .. f.path, true, nil, nil, nil, true)
+            return
+        end
+        out:write(body)
+        out:close()
+    end
+    update_available_version = nil
+    append_message('sys', 'MultiChat', string.format('Updated to v%s. Reloading...', remote), true)
+    AshitaCore:GetChatManager():QueueCommand(1, '/addon reload multichat')
+end
+
 -- ===== Commands =====
 ashita.events.register('command', 'multichat_command_cb', function (e)
     local cmdline = e.command
@@ -565,6 +662,20 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
         for k,_ in pairs(cfg.windows) do center_window_rect(k) end
         for k,_ in pairs(pop) do pop[k].popped = false end
         force_center_frames = 8
+        return
+    end
+
+    -- /multichat checkupdate
+    if lower:startswith('/multichat checkupdate') then
+        e.blocked = true
+        check_for_update()
+        return
+    end
+
+    -- /multichat update
+    if lower:startswith('/multichat update') then
+        e.blocked = true
+        perform_update()
         return
     end
 
@@ -2147,6 +2258,16 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- GetLoginStatus() == 2, so we use the same combined check here.
     local okStatus, loginStatus = pcall(function() return AshitaCore:GetMemoryManager():GetPlayer():GetLoginStatus() end)
     if (not okStatus) or loginStatus ~= 2 or GetPlayerEntity() == nil then return end
+
+    -- One-time auto-check, the first frame this handler runs past the login gate above (i.e.
+    -- once, right after the character is confirmed loaded into the world -- same trigger this
+    -- gate already exists for). https.request is a blocking call, so this causes one brief
+    -- frame hitch -- same accepted tradeoff the approved anglin addon's own update checker
+    -- makes, at the same point in the login sequence.
+    if not update_check_done then
+        update_check_done = true
+        pcall(check_for_update)
+    end
 
     if force_center_frames > 0 then force_center_frames = force_center_frames - 1 end
 

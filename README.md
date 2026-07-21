@@ -78,6 +78,12 @@ A few things worth knowing:
 - `/multichat show` — force the window open and re-center it
 - `/multichat reset` — reset all window positions and re-center
 - `/multichat trans <0-100>` — set window background opacity (also available as a slider in the Settings window)
+- `/multichat checkupdate` — check GitHub for a newer version without installing it
+- `/multichat update` — download and install the latest version, then reload automatically
+
+## Updating
+
+This is the one place MultiChat reaches outside your own client: once per session, right after your character finishes loading into the world, it makes a single HTTPS request to this repo on GitHub to compare versions (same technique the approved **anglin** addon's own updater uses). Nothing is downloaded or changed by this check alone — it only posts a message into SYS (username "MultiChat"), with the tab alert triggering only when a newer version actually exists. Installing an update (`/multichat update`) downloads `multichat.lua`, `README.md`, `LICENSE`, and the `gdifonts/` files fresh from this repo, overwrites the local copies, and reloads the addon automatically — it aborts on the first failed download rather than leaving a partial mix of old and new files. If `socket.ssl.https` isn't available in your Ashita install for some reason, this fails safely and simply does nothing.
 
 ## How to Add Support for Japanese Language Fonts
 
@@ -120,6 +126,7 @@ MultiChat's own code is original, but several techniques were verified against o
 - **[conquest](https://github.com/AddonsXI/conquest)** (official first-party Ashita addon, GPL-3.0) — its `/conquest` results are captured into SYS, colored to match its own per-nation colors. Same no-code-included reasoning as Checker above
 - **[SimpleLog](https://github.com/Spike2D/SimpleLog)** — the live entity-data technique (SpawnFlags/PetTargetIndex) used to tell party/pets/enemies/other players apart for Combat's username coloring
 - **[GdiFonts](https://github.com/ThornyFFXI/gdifonttexture)** (ThornyFFXI) — actually bundled under `gdifonts/` (see License below) for Shift-JIS → UTF-8 conversion
+- **[anglin](https://github.com/Astika2/FFXI/tree/main/addons)** (Astika) — the in-game update-checking approach (see [Updating](#updating)): fetch the raw file from GitHub and regex the `addon.version` line straight out of it, no separate manifest/API needed. No anglin code is included here, only the technique
 
 ## License
 
