@@ -622,6 +622,16 @@ ashita.events.register('packet_in', 'packet_in_cb', function (e)
         if not mode then return end
         local ch = msgtype_to_channel(mode)
         if not ch then return end
+        -- Custom server NPCs (e.g. HorizonXI's achievement-system NPCs) send their dialogue
+        -- through the same native Say packet/mode a player's own /say uses, with the NPC's own
+        -- name as the packet's character-name field -- confirmed via in-game screenshot ("Lady
+        -- Aurelie", "Lorekeeper Isa", "Eeko-Weeko"). A real FFXI player name can only ever be
+        -- pure letters (no spaces, hyphens, digits, or punctuation), so anything else in that
+        -- field is a reliable signal this isn't actually a player, without needing to hardcode
+        -- specific NPC names.
+        if ch == 'say' and not character:match('^%a+$') then
+            ch = 'quest'
+        end
         text = text:gsub('%%', '%%%%')
         append_message(ch, character, clean_str(text), true)
     end)
@@ -1070,6 +1080,24 @@ local function is_known_alliance_member(actor_name)
     return false
 end
 
+-- Emote text ("Kosami nods.", "You wave.") always leads with the actor's name (or "You" for
+-- your own), so the first word is enough to identify who -- reused here, not duplicated, since
+-- is_known_alliance_member already exists for Combat's username coloring. Returns true (and
+-- appends to Party) only when the actor is actually in your party/alliance, per the request to
+-- surface party/alliance emotes specifically, not every emote from anyone nearby.
+local function try_party_emote(line)
+    local actor = line:match('^(%a+) ')
+    if not actor then return false end
+    if actor:lower() == 'you' then
+        local me = current_char_name()
+        if me == '' then return false end
+        actor = me
+    end
+    if not is_known_alliance_member(actor) then return false end
+    append_message('party', actor, line, true)
+    return true
+end
+
 -- Looks up a currently-loaded entity by name (case-insensitive). Same technique as
 -- GetEntityByServerId in the approved SimpleLog addon (lib/functions.lua), just matched by
 -- name instead of server ID since text_in only gives us plain text, not IDs. 2304 is the same
@@ -1290,8 +1318,25 @@ end
 -- name line immediately followed by its damage line) -- and Lua patterns' "." matches newlines,
 -- so matching the raw multi-line blob directly let a pattern like "^(.-) uses .-%.$" swallow
 -- both lines into one garbled entry (blown-out username column, orphaned trailing fragments).
+-- Most recent amount of experience the player themselves gained, for the popped-out Combat
+-- window's display (see the d3d_present handler) -- not part of any message row, just a small
+-- side-effect capture alongside the existing "gains N experience points." pattern below (which
+-- doesn't itself capture the number, only the actor, so this needs its own check).
+local last_exp_gained = nil
+
 local function process_system_line(msg)
     if not msg or msg == '' then return end
+
+    -- Side-effect only (doesn't return) -- the actual Combat-tab row for this message is still
+    -- appended normally further down, via the generic "gains N experience points." entry in
+    -- SYSTEM_MESSAGE_PATTERNS.
+    local expActor, expAmount = msg:match("^(.-) gains (%d+) experience points?%.$")
+    if expActor and expAmount then
+        local me = current_char_name()
+        if me ~= '' and expActor:lower() == me:lower() then
+            last_exp_gained = tonumber(expAmount)
+        end
+    end
 
     -- Skill-ups (combat or craft, disambiguated by skill name -- both use the identical
     -- "${actor}'s ${skill} skill rises/reaches..." shape regardless of category).
@@ -1384,6 +1429,12 @@ local YELL_MODE  = 11
 -- General system messages/broadcasts (SYS tab) -- verified via the same Balloon table
 -- (chat_modes.system = 151), separate from chat_modes.message (150, NPC dialogue) above.
 local SYSTEM_MODE = 151
+-- Emotes ("Kosami nods.") -- same Balloon table (chat_modes.emote = 15), already trusted
+-- elsewhere in this file (see ORDINARY_CHAT_MODES). Reliable enough to key off directly, unlike
+-- Auction House/Checker/conquest above -- there's no ambiguity like mode 121 being shared with
+-- synthesis, and enumerating every possible emote verb phrasing to text-match instead would be
+-- impractical (dozens of emotes, each with its own third-person sentence).
+local EMOTE_MODE = 15
 
 -- Chat modes that are always ordinary player chat, never combat/craft system text -- same
 -- verified table as NPC_DIALOGUE_MODE above (addons/balloon/defines.lua chat_modes). Used to
@@ -1516,6 +1567,8 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
                 append_message('shout', name, body, true, color, nil, nil, false, kind)
             elseif mode == SYSTEM_MODE then
                 append_message('sys', 'System', line, true, SYSTEM_TEXT_COLOR)
+            elseif mode == EMOTE_MODE then
+                try_party_emote(line)
             elseif not (mode and ORDINARY_CHAT_MODES[mode]) then
                 process_system_line(line)
             end
@@ -1650,12 +1703,33 @@ local function resolve_color(setting, channel, fallback)
     return setting.all or fallback
 end
 
-local function draw_wrapped_colored(text, text_color, spans)
+-- `cache_entry`, if given, is the message's own stored row table -- tokenizing and word-
+-- wrapping is real per-character work (CalcTextSize calls included), and redoing it for every
+-- row on every single frame regardless of whether anything changed is what caused the severe
+-- FPS drop after the message cap was raised to 5000 (confirmed via user report during a
+-- leveling party: sustained high message throughput filled the buffer, and every frame was
+-- re-tokenizing/re-measuring the entire thing). Cached lines are reused as long as both the
+-- wrap width and the message text itself are unchanged since the last frame; text is part of
+-- the cache key (not just width) since try_merge_angler_reveal mutates a row's message in place
+-- after it's already been drawn once.
+local function draw_wrapped_colored(text, text_color, spans, cache_entry)
     local ok, avail = pcall(imgui.GetContentRegionAvail)
     local availx = ok and get_x(avail) or 0
     if availx <= 20 then imgui.TextColored(text_color, text); return end
-    local tokens = tokenize_for_wrap(text, spans)
-    local lines = layout_tokens(tokens, availx)
+
+    local lines
+    if cache_entry and cache_entry._wrap_w == availx and cache_entry._wrap_text == text then
+        lines = cache_entry._wrap_lines
+    else
+        local tokens = tokenize_for_wrap(text, spans)
+        lines = layout_tokens(tokens, availx)
+        if cache_entry then
+            cache_entry._wrap_w = availx
+            cache_entry._wrap_text = text
+            cache_entry._wrap_lines = lines
+        end
+    end
+
     for _, line in ipairs(lines) do
         local first = true
         for _,t in ipairs(line) do
@@ -1689,12 +1763,12 @@ local function draw_colored_username(uname, ucolor)
 end
 
 -- Draw one row (copy on click + context)
-local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, spans)
+local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, spans, cache_entry)
     imgui.TextColored(ts_color, timestamp); imgui.SameLine()
     draw_colored_username(uname, ucolor); imgui.SameLine(msg_col_x)
     imgui.PushID(row_id)
     imgui.BeginGroup()
-    draw_wrapped_colored(message, text_color, spans)
+    draw_wrapped_colored(message, text_color, spans, cache_entry)
     imgui.EndGroup()
     local hovered = imgui.IsItemHovered()
     if hovered and imgui.IsMouseClicked(0) then pcall(function() imgui.SetClipboardText(row_full) end) end
@@ -1735,10 +1809,17 @@ local function draw_channel_messages(channel)
     -- for names that aren't actually present.
     local ts_w = text_width(get_timestamp())
     local max_name_w = 0
+    -- Same CalcTextSize cost problem as the message-wrap cache above -- a username never
+    -- changes after a row is created, so its measured width only needs recomputing when the
+    -- font scale itself changes (cfg.font_scale, which CalcTextSize's result depends on),
+    -- not on every single frame regardless.
     bucket:each(function (entry)
         if channel_row_visible(channel, entry) then
-            local w = text_width(entry.username .. ':')
-            if w > max_name_w then max_name_w = w end
+            if entry._uname_w_scale ~= cfg.font_scale then
+                entry._uname_w = text_width(entry.username .. ':')
+                entry._uname_w_scale = cfg.font_scale
+            end
+            if entry._uname_w > max_name_w then max_name_w = entry._uname_w end
         end
     end)
     local msg_col_x = ts_w + 8 + max_name_w + 8
@@ -1758,7 +1839,7 @@ local function draw_channel_messages(channel)
         -- resolve_combat_uname_color) and stored on the entry, rather than re-scanning the
         -- entity table here every frame for every visible row.
         local row_uname_color = (channel == 'combat' and entry.uname_color) or uname_color
-        draw_row(row_timestamp, entry.username, entry.message, row_uname_color, ts_color, row_text_color, row_full, idx, msg_col_x, entry.spans)
+        draw_row(row_timestamp, entry.username, entry.message, row_uname_color, ts_color, row_text_color, row_full, idx, msg_col_x, entry.spans, entry)
     end)
     if pushed_spacing > 0 then pcall(function() imgui.PopStyleVar(pushed_spacing) end) end
 end
@@ -2098,6 +2179,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 -- in-game screenshot.
                 imgui.SameLine(); if is_alerting(channel) then imgui.TextColored({1,0.4,0.4,1}, '!') end
                 imgui.SameLine(); if titlebar_color_button('Copy') then copy_all(channel) end
+                if channel == 'combat' then
+                    imgui.SameLine(); imgui.TextColored(EXP_COLOR, 'Last EXP: ' .. (last_exp_gained and tostring(last_exp_gained) or '-'))
+                end
                 imgui.Separator()
                 -- Window background already carries the tint; keep the child transparent so it
                 -- doesn't double up (two stacked semi-transparent layers would look more opaque

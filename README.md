@@ -18,6 +18,7 @@ This addon should work on any FFXI private server running Ashita v4, but it has 
 - **Craft**: synthesis results and craft/fishing skill-ups, colored by message type
 - **Combat**: hits/misses/crits, TP moves, casting, status effects, HP/MP recovery, defeats, skill-ups, item drops/use, experience, level up/down — colored by message type and by who's acting (see [Color reference](#color-reference))
 - **NPC**: dialogue (with the speaker's name) and quest/event reward items
+- **Party**: also includes emotes ("Kosami nods.") from anyone currently in your party/alliance, not just party chat
 - **SYS**: general system broadcasts, plus Auction House messages, the **Checker** and **conquest** addons' results, and the server's own "Conquest update:" broadcast — each labeled by source (System/Auction/Checker/Conquest) and colored to match (see [Color reference](#color-reference))
 - Achievement unlocks and hardcore-character milestones broadcast to *every* tab at once, in a distinct color, since they're notable regardless of which tab is active
 - Craft/Combat's "Everyone / Myself" filter and Shout/Yell's "Both / Shout / Yell" filter apply retroactively to history already captured, not just messages received after you change them
@@ -58,13 +59,16 @@ Every channel works the same basic way: read data the game already sends to (or 
 | NPC dialogue | `text_in`, chat mode 150 — same mode the approved **Balloon** addon uses for its speech bubbles |
 | Shout, Yell | `text_in`, chat modes 10/11 |
 | SYS (general broadcasts) | `text_in`, chat mode 151 (Balloon's `chat_modes.system`) |
+| Party/alliance emotes | `text_in`, chat mode 15 (Balloon's `chat_modes.emote`), only when the actor is actually in your party/alliance |
 | Auction House, Checker, conquest, "Conquest update:" | `text_in`, matched by text rather than mode — see below |
 
 A few things worth knowing:
 
 - Craft/Combat's phrase list isn't exhaustive yet — some less common messages may not be categorized on the first pass. Ordinary player chat is excluded from this matching entirely by its chat mode, so a line can't be mistaken for a combat/craft message just because it contains a similar-looking phrase.
 - NPC dialogue's "Name : text" split uses the same technique Balloon uses for its own speaker extraction. An unprefixed continuation line (an NPC's own second sentence, not a different speaker) inherits the most recent speaker within the same event instead of falling back to a generic "NPC" label.
+- Some custom server NPCs (e.g. HorizonXI's achievement-system NPCs) send their dialogue through the same native Say packet/mode a player's own `/say` uses, rather than the proper NPC dialogue mode. Since a real FFXI player name can only ever be pure letters (no spaces, hyphens, digits, or punctuation), an incoming Say whose sender name isn't is rerouted to NPC instead -- reliable without needing to hardcode specific NPC names.
 - Achievement unlocks and hardcore-character milestones are checked *before* any mode-based routing (by text, since they matter regardless of what mode they arrive under), so they get their own broadcast-to-every-tab treatment instead of just showing up in SYS.
+- Party/alliance emotes are matched by their leading word ("Kosami nods.", "You wave." → resolved to your own name), then checked against your current party/alliance roster -- the same technique already used for Combat's username coloring -- so emotes from anyone *not* currently in your party/alliance are left alone.
 - Auction House, **Checker**, and **conquest** are matched by text specifically because mode can't distinguish them: Checker and conquest build their own output via `print()` (no mode at all), and Auction House shares mode 121 with synthesis results. The server's "Conquest update:" broadcast is likewise text-matched (its exact mode isn't confirmed), requiring an exact known nation name before "- \<level\>" so it can't misfire on unrelated chat formatted similarly.
 - FFXI's text is Shift-JIS, not UTF-8, which ImGui doesn't understand on its own — unconverted, every byte renders as its own "?" placeholder regardless of font. Real Japanese text (and Latin-1 accented characters) is converted using the [GdiFonts](https://github.com/ThornyFFXI/gdifonttexture) library (MIT license, bundled under `gdifonts/`), the same technique **Balloon** uses. A handful of individual typographic symbols (curly quotes, stars, etc.) are mapped to plain ASCII instead of their real Unicode codepoints, since even once correctly converted, the loaded font's Japanese glyph range doesn't cover those general symbol/punctuation blocks.
 
