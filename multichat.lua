@@ -865,6 +865,11 @@ local function is_auction_house_message(line)
     -- Sale confirmation to the seller -- confirmed via in-game screenshot ("Your 'Moat carp'
     -- has sold to Quesogrande for 3000 gil!").
     if line:match("^Your '.-' has sold to .- for %d+ gil!$") then return true end
+    -- Purchase confirmation to the buyer -- confirmed via in-game screenshot ("You buy the
+    -- bottle of Yagudo drink for 1,700 gil."). The gil amount can have thousands-separator
+    -- commas ("1,700"), unlike the plain-digit amounts in the other AH messages above, so this
+    -- needs its own digit-or-comma pattern rather than reusing %d+.
+    if line:match("^You buy the .- for [%d,]+ gil%.$") then return true end
     return false
 end
 
@@ -1704,12 +1709,14 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
                 -- mode check can't distinguish the two. Text matching stays the correct approach
                 -- here, not a workaround for an unknown mode.
                 -- Labeled "Auction" rather than "System" so it's visually distinct from actual
-                -- system broadcasts even though both share the SYS tab. Sale notifications alert
-                -- like SYS normally does (see mark_alert_if_needed); every other AH message
-                -- (listing confirmation, fees, etc.) stays silent -- less urgent than knowing an
-                -- item actually sold.
-                local ahItem = line:match("^Your '(.-)' has sold to .- for %d+ gil!$")
-                append_message('sys', 'Auction', line, true, AH_TEXT_COLOR, nil, find_item_span(line, ahItem), not ahItem)
+                -- system broadcasts even though both share the SYS tab. Only a sale notification
+                -- alerts like SYS normally does (see mark_alert_if_needed) -- confirmed via user
+                -- feedback that a purchase (something *they* bought) shouldn't alert, only a sale
+                -- (someone buying something they listed) is what they want flagged. Every other
+                -- AH message (listing confirmation, fees, purchase confirmations) stays silent.
+                local saleItem = line:match("^Your '(.-)' has sold to .- for %d+ gil!$")
+                local buyItem = line:match("^You buy the (.-) for [%d,]+ gil%.$")
+                append_message('sys', 'Auction', line, true, AH_TEXT_COLOR, nil, find_item_span(line, saleItem or buyItem), not saleItem)
             elseif try_checker_message(line) then
                 -- Already fully handled inside try_checker_message.
             elseif try_conquest_addon_message(line) then
