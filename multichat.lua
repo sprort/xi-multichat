@@ -1191,6 +1191,24 @@ local function is_known_alliance_member(actor_name)
     return false
 end
 
+-- Whether anyone besides the player themselves currently occupies a party/alliance slot.
+-- Needed specifically for the player's own emotes below -- the player's own name always
+-- occupies slot 0 in the party memory block even when not partied at all (solo), which alone
+-- is enough for is_known_alliance_member to report a match, so "You" resolving to a known
+-- alliance member isn't by itself proof of an actual party. Confirmed via user report: a solo
+-- player's own emote was showing in Party. Not a concern for other actors' names (a solo
+-- player has no other slots for another name to match against in the first place).
+local function has_other_party_members()
+    local ok, party = pcall(function() return AshitaCore:GetMemoryManager():GetParty() end)
+    if not ok or not party then return false end
+    local total = 0
+    for _, count_fn in ipairs({'GetAlliancePartyMemberCount1', 'GetAlliancePartyMemberCount2', 'GetAlliancePartyMemberCount3'}) do
+        local okCount, count = pcall(function() return party[count_fn](party) end)
+        if okCount and count and count > 0 and count <= 6 then total = total + count end
+    end
+    return total > 1
+end
+
 -- Emote text ("Kosami nods.", "You wave.") always leads with the actor's name (or "You" for
 -- your own), so the first word is enough to identify who -- reused here, not duplicated, since
 -- is_known_alliance_member already exists for Combat's username coloring. Returns true (and
@@ -1200,6 +1218,7 @@ local function try_party_emote(line)
     local actor = line:match('^(%a+) ')
     if not actor then return false end
     if actor:lower() == 'you' then
+        if not has_other_party_members() then return false end
         local me = current_char_name()
         if me == '' then return false end
         actor = me
