@@ -33,7 +33,7 @@ This addon should work on any FFXI private server running Ashita v4, but it has 
 - Invert-flashing alert indicator for unseen messages (visual only, no sound)
 - Click a line to copy it, or use the right-click menu to copy name/message/line
 - Duplicate-message suppression
-- 5000-line-per-channel history, backed by a ring buffer so the cap stays cheap regardless of size
+- 5000-line-per-channel history, backed by a ring buffer so the cap stays cheap regardless of size (the most recent 500 lines are the ones drawn in the window; the full history is still what Copy grabs, keeping the per-frame render cost bounded during heavy combat)
 - Stays hidden until you're actually logged into the world (safe for auto-load from `default.txt`)
 - Settings persist across sessions
 

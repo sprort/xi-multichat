@@ -36,6 +36,17 @@ print(string.format('[%s] v%s loaded. Type /multichat to toggle the window (Sett
 -- RingBuffer below), whose eviction is O(1) regardless of size, so this can be sized generously
 -- (enough to review a whole fight or conversation afterward) without a growing per-message cost.
 local MAX_MESSAGES_PER_CHANNEL = 5000;
+-- How many of a channel's most recent (visible-after-filter) messages are actually drawn per
+-- frame. Storage stays at MAX_MESSAGES_PER_CHANNEL above (so Copy still grabs the whole
+-- history), but the per-frame render cost -- ImGui draw calls plus per-row string/timestamp
+-- work -- scales with what's *drawn*, not what's stored. Rendering all 5000 was the cause of a
+-- severe FPS drop reported after ~30 min in a leveling party, once Combat's buffer filled:
+-- every frame was emitting thousands of off-screen rows' worth of draw calls and os.date/
+-- string.format allocations. Only the last few hundred lines are realistically scrolled through
+-- live anyway (deep review is better served by the copy-out and the planned on-disk log), so
+-- this bounds the live render window while leaving stored history untouched. Raise it for more
+-- in-window scrollback at some per-frame cost.
+local MAX_RENDERED_ROWS = 500;
 -- Reference point size the Font Size slider displays against. cfg.font_scale (the value actually
 -- passed to imgui.SetWindowFontScale) is stored as a ratio, not an absolute size, since Ashita's
 -- loaded font(s) are whatever size(s) the player's own boot profile configured; this is purely
@@ -2025,35 +2036,58 @@ local function draw_channel_messages(channel)
         text_color   = resolve_color(cfg.colors.text, channel, {1,1,1,1})
     end
 
+    -- Only the last MAX_RENDERED_ROWS visible rows are drawn (see that constant). Count the
+    -- visible rows first so we know how many older ones to skip -- a cheap O(n) pass of table
+    -- lookups (no ImGui, no os.date), unlike the draw pass it's bounding.
+    local visible_count = 0
+    bucket:each(function (entry)
+        if channel_row_visible(channel, entry) then visible_count = visible_count + 1 end
+    end)
+    local skip = visible_count - MAX_RENDERED_ROWS
+    if skip < 0 then skip = 0 end
+
     -- Fixed column start for message text: measured from the current timestamp format's width
-    -- plus the widest username currently in this channel's history (not a hypothetical
-    -- worst-case), so message text lines up across all visible rows without reserving space
-    -- for names that aren't actually present.
+    -- plus the widest username among the rows actually being rendered (not a hypothetical
+    -- worst-case, and not the whole stored history -- only what's drawn), so message text lines
+    -- up across all visible rows without reserving space for names that aren't shown.
     local ts_w = text_width(get_timestamp())
     local max_name_w = 0
-    -- Same CalcTextSize cost problem as the message-wrap cache above -- a username never
-    -- changes after a row is created, so its measured width only needs recomputing when the
-    -- font scale itself changes (cfg.font_scale, which CalcTextSize's result depends on),
-    -- not on every single frame regardless.
+    -- Username width only needs recomputing when the font scale changes (CalcTextSize depends on
+    -- it); a username never changes after a row is created. Cached on the entry.
+    local seen_w = 0
     bucket:each(function (entry)
-        if channel_row_visible(channel, entry) then
-            if entry._uname_w_scale ~= cfg.font_scale then
-                entry._uname_w = text_width(entry.username .. ':')
-                entry._uname_w_scale = cfg.font_scale
-            end
-            if entry._uname_w > max_name_w then max_name_w = entry._uname_w end
+        if not channel_row_visible(channel, entry) then return end
+        seen_w = seen_w + 1
+        if seen_w <= skip then return end
+        if entry._uname_w_scale ~= cfg.font_scale then
+            entry._uname_w = text_width(entry.username .. ':')
+            entry._uname_w_scale = cfg.font_scale
         end
+        if entry._uname_w > max_name_w then max_name_w = entry._uname_w end
     end)
     local msg_col_x = ts_w + 8 + max_name_w + 8
 
+    -- Timestamp-format signature: the formatted timestamp string and the full "ts name: msg"
+    -- copy string are cached per entry and only rebuilt when this changes, rather than calling
+    -- os.date + string.format for every drawn row every frame (a major allocation/GC cost at
+    -- scale). Username and message never change after creation, so the timestamp format is the
+    -- only thing that can invalidate them.
+    local ts_sig = (cfg.timestamp_12h and '12' or '24') .. (cfg.timestamp_format or 'hms')
+
     local idx = 0
+    local seen_d = 0
     local pushed_spacing = 0
     if pcall(function() imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {8, cfg.line_spacing or 4}) end) then pushed_spacing = 1 end
     bucket:each(function (entry)
         if not channel_row_visible(channel, entry) then return end
+        seen_d = seen_d + 1
+        if seen_d <= skip then return end
         idx = idx + 1
-        local row_timestamp = format_timestamp(entry.epoch)
-        local row_full = string.format("%s %s: %s", row_timestamp, entry.username, entry.message)
+        if entry._ts_sig ~= ts_sig then
+            entry._ts_str = format_timestamp(entry.epoch)
+            entry._row_full = string.format("%s %s: %s", entry._ts_str, entry.username, entry.message)
+            entry._ts_sig = ts_sig
+        end
         -- entry.text_color is honored on every channel, not just Craft/Combat, so a broadcast
         -- message (currently just achievement unlocks) renders in the same color everywhere.
         local row_text_color = entry.text_color or text_color
@@ -2061,7 +2095,7 @@ local function draw_channel_messages(channel)
         -- resolve_combat_uname_color) and stored on the entry, rather than re-scanning the
         -- entity table here every frame for every visible row.
         local row_uname_color = (channel == 'combat' and entry.uname_color) or uname_color
-        draw_row(row_timestamp, entry.username, entry.message, row_uname_color, ts_color, row_text_color, row_full, idx, msg_col_x, entry.spans, entry)
+        draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, idx, msg_col_x, entry.spans, entry)
     end)
     if pushed_spacing > 0 then pcall(function() imgui.PopStyleVar(pushed_spacing) end) end
 end
