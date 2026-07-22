@@ -1353,18 +1353,13 @@ end
 local combat_uname_color_cache = {}
 local COMBAT_UNAME_CACHE_TTL = 5.0
 
--- Any player's pet -- avatars, elemental spirits, BST jug pets, wyverns, automatons -- occupies
--- the high entity-index range (TargetIndex > 1791), while wild monsters sit below it. Verified
--- against the approved SimpleLog addon (actionhandlers.lua:875, "actor_table.TargetIndex >
--- 1791" is exactly how it distinguishes a pet from a mob). This is the reliable, general way to
--- tell an alliance member's pet from an enemy: the per-owner linkage is_known_pet_entity relies
--- on (entity.PetTargetIndex) isn't populated client-side for anyone but yourself, so other
--- players' pets -- jug pets like a BST's, or a party summoner's avatar -- otherwise fall
--- through and, being mob-flagged rather than player-flagged, get mistaken for enemies. The
--- index-range check needs no ownership data and no per-name list. It also naturally keeps an
--- avatar-*prime* notorious monster (a real mob you fight, in the low index range) colored as an
--- enemy, unlike a name match would.
-local MAX_MOB_TARGET_INDEX = 1791
+-- SpawnFlags bit that marks an entity as a monster. Confirmed via in-game diagnostic on
+-- HorizonXI: a real mob (Arid Lizard) had SpawnFlags 0x10, while pets -- a BST jug pet
+-- (LullabyMelodia) and a party summoner's avatar (Garuda) -- had 0x02 (NPC), no 0x10. So the
+-- monster bit, not the entity-index range (an earlier attempt using TargetIndex > 1791 wrongly
+-- flagged that Arid Lizard, which sat at 1792, as a pet), is what separates an enemy from a
+-- pet. Any non-player entity without this bit that turns up as a combat actor is a pet/summon.
+local MONSTER_SPAWN_FLAG = 0x10
 
 -- Resolves the Combat username color for an actor: your own name is one shade of blue and
 -- party/alliance members are a different shade; pets/summons are light green; confirmed NPC/
@@ -1384,25 +1379,31 @@ local function resolve_combat_uname_color(actor_name)
     end
 
     local color = PLAYER_NAME_COLOR
-    local ok, ent = pcall(find_entity_by_name, actor_name)
-    if ok and ent then
-        if is_known_pet_entity(ent) then
-            color = PET_NAME_COLOR
-        elseif entity_is_npc(ent) == true then
-            -- Mob-flagged: a wild monster (enemy) unless it's actually a pet, told apart by the
-            -- entity-index range (see MAX_MOB_TARGET_INDEX) -- this is what catches other
-            -- players' pets (a BST's jug pet, a party summoner's avatar) that the ownership
-            -- linkage above misses, so they show as pets rather than enemies.
-            local okTi, ti = pcall(function() return ent.TargetIndex end)
-            if okTi and ti and ti > MAX_MOB_TARGET_INDEX then
+    -- Party/alliance membership is checked first, by name against the party roster -- reliable,
+    -- and it means a trust or any allied player is always the alliance shade regardless of how
+    -- its entity happens to be flagged (a trust is an NPC-type entity). Only non-members fall
+    -- through to entity-based classification.
+    if is_known_alliance_member(actor_name) then
+        color = ALLY_NAME_COLOR
+    else
+        local ok, ent = pcall(find_entity_by_name, actor_name)
+        if ok and ent then
+            if is_known_pet_entity(ent) then
                 color = PET_NAME_COLOR
-            else
-                color = ENEMY_NAME_COLOR
+            elseif entity_is_npc(ent) == true then
+                -- Non-player entity: a monster if it carries the monster SpawnFlag, otherwise a
+                -- pet/summon (see MONSTER_SPAWN_FLAG). This is what colors other players' pets
+                -- (a BST's jug pet, a party summoner's avatar) as pets rather than enemies --
+                -- the per-owner linkage is_known_pet_entity relies on isn't populated
+                -- client-side for anyone but yourself.
+                local okSf, sf = pcall(function() return ent.SpawnFlags end)
+                if okSf and sf and bit.band(sf, MONSTER_SPAWN_FLAG) ~= 0 then
+                    color = ENEMY_NAME_COLOR
+                else
+                    color = PET_NAME_COLOR
+                end
             end
         end
-    end
-    if color == PLAYER_NAME_COLOR and is_known_alliance_member(actor_name) then
-        color = ALLY_NAME_COLOR
     end
 
     combat_uname_color_cache[lname] = { color = color, t = now }
