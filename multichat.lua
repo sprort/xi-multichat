@@ -534,8 +534,14 @@ end
 -- time rather than at capture time -- used by Shout/Yell (see channel_row_visible) so that
 -- switching the Both/Shout/Yell filter can retroactively show/hide history already captured,
 -- instead of only ever affecting messages captured after the switch.
-local function append_message(channel, username, msg, is_incoming, text_color, uname_color, spans, no_alert, kind)
-    if is_duplicate_and_mark(channel, username, msg) then return end
+-- `no_dedupe`, if true, skips duplicate suppression -- for message types where byte-identical
+-- lines close together are genuinely distinct events rather than a double-capture of one event.
+-- Delivery box claims are the case (claiming a stack of the same item at the same price emits
+-- several identical "Slot N:" / "The money the buyer paid..." lines within a second or two, all
+-- real); safe because such messages only arrive through the single text_in path, so there's no
+-- second code path that could double-capture one and legitimately need de-duping.
+local function append_message(channel, username, msg, is_incoming, text_color, uname_color, spans, no_alert, kind, no_dedupe)
+    if not no_dedupe and is_duplicate_and_mark(channel, username, msg) then return end
     local bucket = chat.messages[channel]
     if not bucket then return end
     bucket:push({ epoch = os.time(), username = username, message = msg, text_color = text_color, uname_color = uname_color, spans = spans, kind = kind })
@@ -873,22 +879,6 @@ local function is_auction_house_message(line)
     return false
 end
 
--- Delivery box messages (claiming Auction House sale proceeds from the mog house delivery box,
--- 8 numbered slots) -- text matched, not mode, same reasoning as Auction House above. Confirmed
--- via in-game screenshot ("Slot 5:", "The money the buyer paid for the bird egg you put on
--- auction, 50 gil.", "You take the 50 gil out of delivery slot 5."). Kept as its own username
--- ("Delivery") rather than folded into the Auction messages above, per explicit request. No
--- alert -- this is routine bookkeeping after a sale, not something needing attention the way
--- the sale notification itself already does.
-local function try_delivery_message(line)
-    local item = line:match('^The money the buyer paid for the (.-) you put on auction, [%d,]+ gil%.$')
-    local isDelivery = item ~= nil
-        or line:match('^Slot %d+:$')
-        or line:match('^You take the [%d,]+ gil out of delivery slot %d+%.$')
-    if not isDelivery then return false end
-    append_message('sys', 'Delivery', line, true, AH_TEXT_COLOR, nil, find_item_span(line, item), true)
-    return true
-end
 
 -- Checker (the official, first-party Ashita addon) prints its own /check results itself via
 -- print() with Ashita's chat color codes (see addons/Checker/checker.lua) rather than the game
@@ -1410,6 +1400,27 @@ local function find_item_span(body, item_name)
     local s, e = body:find(item_name, 1, true)
     if not s then return nil end
     return { { s = s, e = e, color = ITEM_NAME_COLOR } }
+end
+
+-- Delivery box messages (claiming Auction House sale proceeds from the mog house delivery box,
+-- 8 numbered slots) -- text matched, not mode, same reasoning as Auction House above. Confirmed
+-- via in-game screenshot ("Slot 5:", "The money the buyer paid for the bird egg you put on
+-- auction, 50 gil.", "You take the 50 gil out of delivery slot 5."). Kept as its own username
+-- ("Delivery") rather than folded into the Auction messages, per explicit request. No alert --
+-- routine bookkeeping after a sale, not something needing attention the way the sale
+-- notification itself already does. Defined here (rather than beside is_auction_house_message)
+-- specifically because it calls find_item_span above -- placing it earlier resolved that as a
+-- nil global and errored the whole text_in callback.
+local function try_delivery_message(line)
+    local item = line:match('^The money the buyer paid for the (.-) you put on auction, [%d,]+ gil%.$')
+    local isDelivery = item ~= nil
+        or line:match('^Slot %d+:$')
+        or line:match('^You take the [%d,]+ gil out of delivery slot %d+%.$')
+    if not isDelivery then return false end
+    -- no_alert = true (routine bookkeeping) and no_dedupe = true (repeated identical payout
+    -- lines from claiming a stack of the same item are all real, not double-captures).
+    append_message('sys', 'Delivery', line, true, AH_TEXT_COLOR, nil, find_item_span(line, item), true, nil, true)
+    return true
 end
 
 -- Merges the Angler ability's catch-reveal ("Your keen angler's senses tell you that this is
