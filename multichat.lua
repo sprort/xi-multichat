@@ -1455,6 +1455,22 @@ local function strip_leading_article(name)
     return name:match('^[Tt]he%s+(.+)$') or name
 end
 
+-- FFXI attributes a ranged attack to a possessive phrase rather than the bare name -- "X's
+-- ranged attack hits Y for N points of damage." (another entity) or "Your ranged attack hits
+-- Y..." (yourself) -- so the loose "^(.-) hits ..." actor capture grabs the whole
+-- "X's ranged attack" as the username. Confirmed via in-game screenshot ("Infamousgalka's
+-- ranged attack: hits the Cave Worm for 0 points of damage."). This reduces the captured actor
+-- back to just the entity (so the username resolves to a real entity for coloring, and reads
+-- cleanly), returning the "ranged attack" bit to be folded back into the message body instead.
+-- Constrained to the confirmed "ranged attack" phrasing rather than any "'s ..." possessive, to
+-- avoid misfiring on a mob whose actual name happens to contain "'s".
+local function resolve_ranged_attack_actor(actor)
+    local owner = actor:match("^(%a+)'s ranged attack$")
+    if owner then return owner, 'ranged attack' end
+    if actor:match('^[Yy]our ranged attack$') then return 'You', 'ranged attack' end
+    return actor, nil
+end
+
 -- Rejects implausibly long "actor" captures from the loose SYSTEM_MESSAGE_PATTERNS entries
 -- (uses/casts/hits/misses/etc.). Real actor names (players, mobs, even long-titled NMs) are a
 -- handful of words at most. This was the original fix for ordinary LS/Shout chat coincidentally
@@ -1598,6 +1614,15 @@ local function process_system_line(msg)
                 -- name, so the body text doesn't still start with "You" once the username
                 -- column already shows the resolved name.
                 local body = strip_actor_prefix(msg, actor)
+                -- Ranged attacks capture as "X's ranged attack" / "Your ranged attack" -- reduce
+                -- to the bare entity for the username and fold "ranged attack" back into the body
+                -- (see resolve_ranged_attack_actor). body starts after the full original actor
+                -- (strip_actor_prefix also removed the trailing "'s"), so re-prepend the phrase.
+                local rangedOwner, rangedPhrase = resolve_ranged_attack_actor(actor)
+                if rangedPhrase then
+                    actor = rangedOwner
+                    body = rangedPhrase .. ' ' .. body
+                end
                 local spans = entry.item_capture and find_item_span(body, matches[entry.item_capture])
                 if actor:lower() == 'you' then
                     local me = current_char_name()
