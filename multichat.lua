@@ -703,13 +703,18 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
         return
     end
 
-    -- Mirror outgoing /tell (/t Name message or /tell Name message)
+    -- Mirror outgoing /tell (/t Name message or /tell Name message). The recipient is shown in
+    -- the username itself (">>Abbynightwish") rather than a separate column or a per-message
+    -- prefix, reusing FFXI's own native ">>Name :" convention for outgoing tells exactly as-is
+    -- (no redundant "Sprort" prefix -- an outgoing tell already implies it's from you, the same
+    -- way the native log doesn't repeat your own name either) -- confirmed via user report that
+    -- scrolling back through Tell history otherwise gives no way to tell who an outgoing
+    -- message actually went to, without adding much column width doing it.
     local target, tmsg = cmdline:match('^/[Tt]ell%s+(%S+)%s+(.+)$')
     if not target then target, tmsg = cmdline:match('^/t%s+(%S+)%s+(.+)$') end
     if target and tmsg then
-        local me = current_char_name()
         tmsg = clean_str(tmsg)
-        append_message('tell', me ~= '' and me or 'Me', tmsg, false)
+        append_message('tell', '>>' .. target, tmsg, false)
         return
     end
 end)
@@ -743,8 +748,12 @@ ashita.events.register('packet_in', 'packet_in_cb', function (e)
         if ch == 'say' and not character:match('^%a+$') then
             ch = 'quest'
         end
+        -- Matches FFXI's own native convention for incoming tells (trailing ">>", vs. the
+        -- leading ">>" outgoing tells use -- see the /tell command mirror above) -- the arrow
+        -- points toward whichever side actually sent it.
+        local displayName = (ch == 'tell') and (character .. '>>') or character
         text = text:gsub('%%', '%%%%')
-        append_message(ch, character, clean_str(text), true)
+        append_message(ch, displayName, clean_str(text), true)
     end)
 end)
 
@@ -1209,22 +1218,43 @@ local function has_other_party_members()
     return total > 1
 end
 
--- Emote text ("Kosami nods.", "You wave.") always leads with the actor's name (or "You" for
--- your own), so the first word is enough to identify who -- reused here, not duplicated, since
--- is_known_alliance_member already exists for Combat's username coloring. Returns true (and
--- appends to Party) only when the actor is actually in your party/alliance, per the request to
--- surface party/alliance emotes specifically, not every emote from anyone nearby.
+-- Wraps is_known_alliance_member with the self-when-solo correction above: for the player's
+-- own name specifically, being a "known alliance member" isn't enough on its own (see
+-- has_other_party_members' comment) -- for any other name, is_known_alliance_member alone is
+-- already correct.
+local function is_genuine_party_member(actor_name)
+    if actor_name:lower() == current_char_name():lower() then
+        return has_other_party_members()
+    end
+    return is_known_alliance_member(actor_name)
+end
+
+-- Emote text ("Kosami nods.", "You wave.", "Sprort waves to Abbynightwish.") always leads with
+-- the actor's name (or "You" for your own), so the first word is enough to identify who --
+-- reused here, not duplicated, since is_known_alliance_member already exists for Combat's
+-- username coloring. Confirmed via user report/screenshot: a targeted emote at someone outside
+-- the party/alliance was still landing in Party just because the *actor* happened to be a
+-- party member -- the target matters too, not just the actor. Qualifies for Party only when
+-- the actor is a party/alliance member AND (if the emote names a target at all) that target is
+-- too; otherwise it's routed to Say instead of being silently dropped, matching how ordinary
+-- nearby chat already behaves.
 local function try_party_emote(line)
     local actor = line:match('^(%a+) ')
     if not actor then return false end
     if actor:lower() == 'you' then
-        if not has_other_party_members() then return false end
         local me = current_char_name()
         if me == '' then return false end
         actor = me
     end
-    if not is_known_alliance_member(actor) then return false end
-    append_message('party', actor, line, true)
+
+    local target = line:match('%sto (%a+)%.?!?$') or line:match('%sat (%a+)%.?!?$')
+
+    local qualifies = is_genuine_party_member(actor)
+    if qualifies and target then
+        qualifies = is_genuine_party_member(target)
+    end
+
+    append_message(qualifies and 'party' or 'say', actor, line, true)
     return true
 end
 
