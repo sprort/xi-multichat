@@ -873,6 +873,23 @@ local function is_auction_house_message(line)
     return false
 end
 
+-- Delivery box messages (claiming Auction House sale proceeds from the mog house delivery box,
+-- 8 numbered slots) -- text matched, not mode, same reasoning as Auction House above. Confirmed
+-- via in-game screenshot ("Slot 5:", "The money the buyer paid for the bird egg you put on
+-- auction, 50 gil.", "You take the 50 gil out of delivery slot 5."). Kept as its own username
+-- ("Delivery") rather than folded into the Auction messages above, per explicit request. No
+-- alert -- this is routine bookkeeping after a sale, not something needing attention the way
+-- the sale notification itself already does.
+local function try_delivery_message(line)
+    local item = line:match('^The money the buyer paid for the (.-) you put on auction, [%d,]+ gil%.$')
+    local isDelivery = item ~= nil
+        or line:match('^Slot %d+:$')
+        or line:match('^You take the [%d,]+ gil out of delivery slot %d+%.$')
+    if not isDelivery then return false end
+    append_message('sys', 'Delivery', line, true, AH_TEXT_COLOR, nil, find_item_span(line, item), true)
+    return true
+end
+
 -- Checker (the official, first-party Ashita addon) prints its own /check results itself via
 -- print() with Ashita's chat color codes (see addons/Checker/checker.lua) rather than the game
 -- sending them as ordinary chat text, so there's no packet/mode to key off of -- text matching
@@ -1717,6 +1734,8 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
                 local saleItem = line:match("^Your '(.-)' has sold to .- for %d+ gil!$")
                 local buyItem = line:match("^You buy the (.-) for [%d,]+ gil%.$")
                 append_message('sys', 'Auction', line, true, AH_TEXT_COLOR, nil, find_item_span(line, saleItem or buyItem), not saleItem)
+            elseif try_delivery_message(line) then
+                -- Already fully handled inside try_delivery_message.
             elseif try_checker_message(line) then
                 -- Already fully handled inside try_checker_message.
             elseif try_conquest_addon_message(line) then
