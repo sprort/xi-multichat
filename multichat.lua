@@ -1288,13 +1288,23 @@ end
 local function find_entity_by_name(name)
     if not name or name == '' then return nil end
     local lname = name:lower()
-    for i = 0, 2303 do
-        local ok, ent = pcall(GetEntity, i)
-        if ok and ent and ent.Name and ent.Name ~= '' and ent.Name:lower() == lname then
-            return ent
+    local found
+    -- One pcall around the entire scan rather than one per GetEntity call. This loop runs up to
+    -- 2304 iterations per lookup, and a pcall per iteration is real overhead that added up badly
+    -- when many distinct actors show up in quick succession -- e.g. idling in a busy town where
+    -- lots of nearby players are casting buffs/using items, each a new combat-channel actor to
+    -- resolve. GetEntity on a valid 0..2303 index doesn't throw, so the per-call guard bought
+    -- nothing; the single outer pcall still protects against an unexpected failure.
+    pcall(function()
+        for i = 0, 2303 do
+            local ent = GetEntity(i)
+            if ent and ent.Name and ent.Name ~= '' and ent.Name:lower() == lname then
+                found = ent
+                return
+            end
         end
-    end
-    return nil
+    end)
+    return found
 end
 
 -- Whether a found entity is an NPC/monster rather than a player. Verified bit check, taken
@@ -1350,8 +1360,15 @@ end
 -- Cache of actor-name -> resolved Combat username color, so a mob/player hit repeatedly across
 -- many messages in a fight (the common case) doesn't re-scan the full entity table every time.
 -- Short TTL since entities can change (a mob dies, a same-named replacement spawns later).
+-- Pruned periodically (see the sweep in resolve_combat_uname_color): without it the table grew
+-- without bound -- idling in a busy town where lots of distinct nearby players cast buffs/use
+-- items generates combat-routed messages under ever-more names, and each left a permanent
+-- entry, so the table and the GC work to walk it grew the longer you sat there, steadily
+-- degrading frame time. Confirmed via user report of worsening frame drops after extended idling.
 local combat_uname_color_cache = {}
 local COMBAT_UNAME_CACHE_TTL = 5.0
+local combat_uname_cache_inserts = 0
+local COMBAT_UNAME_CACHE_PRUNE_EVERY = 128
 
 -- SpawnFlags bit that marks an entity as a monster. Confirmed via in-game diagnostic on
 -- HorizonXI: a real mob (Arid Lizard) had SpawnFlags 0x10, while pets -- a BST jug pet
@@ -1407,6 +1424,15 @@ local function resolve_combat_uname_color(actor_name)
     end
 
     combat_uname_color_cache[lname] = { color = color, t = now }
+    -- Sweep expired entries every so often (amortized, not every insert) so the cache stays
+    -- bounded to roughly one TTL window's worth of distinct actors instead of growing forever.
+    combat_uname_cache_inserts = combat_uname_cache_inserts + 1
+    if combat_uname_cache_inserts >= COMBAT_UNAME_CACHE_PRUNE_EVERY then
+        combat_uname_cache_inserts = 0
+        for k, v in pairs(combat_uname_color_cache) do
+            if (now - v.t) >= COMBAT_UNAME_CACHE_TTL then combat_uname_color_cache[k] = nil end
+        end
+    end
     return color
 end
 
