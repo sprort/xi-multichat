@@ -1574,14 +1574,15 @@ end
 -- ranged attack hits Y for N points of damage." (another entity) or "Your ranged attack hits
 -- Y..." (yourself) -- so the loose "^(.-) hits ..." actor capture grabs the whole
 -- "X's ranged attack" as the username. Confirmed via in-game screenshot ("Infamousgalka's
--- ranged attack: hits the Cave Worm for 0 points of damage."). This reduces the captured actor
--- back to just the entity (so the username resolves to a real entity for coloring, and reads
--- cleanly), returning the "ranged attack" bit to be folded back into the message body instead.
--- Constrained to the confirmed "ranged attack" phrasing rather than any "'s ..." possessive, to
--- avoid misfiring on a mob whose actual name happens to contain "'s".
+-- ranged attack: ...", "Orcish Stonechucker's ranged attack: ..."). This reduces the captured
+-- actor back to just the entity (so the username resolves to a real entity for coloring, and
+-- reads cleanly), returning the "ranged attack" bit to be folded into the message body instead.
+-- The owner is anything before the trailing "'s ranged attack" -- not just a single word --
+-- since mob names are often multiple words (e.g. "Orcish Stonechucker"); still constrained to
+-- the exact "ranged attack" phrasing so it can't misfire on some other "'s ..." possessive.
 local function resolve_ranged_attack_actor(actor)
-    local owner = actor:match("^(%a+)'s ranged attack$")
-    if owner then return owner, 'ranged attack' end
+    local owner = actor:match("^(.-)'s ranged attack$")
+    if owner and owner ~= '' then return owner, 'ranged attack' end
     if actor:match('^[Yy]our ranged attack$') then return 'You', 'ranged attack' end
     return actor, nil
 end
