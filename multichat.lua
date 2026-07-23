@@ -650,6 +650,13 @@ local function perform_update()
     AshitaCore:GetChatManager():QueueCommand(1, '/addon reload multichat')
 end
 
+-- Shout and Yell share one tab but are colored distinctly per-message so the two are easy to
+-- tell apart at a glance even when both are shown together. Defined here (rather than beside the
+-- other combat/message colors further down) so the command hook below, which mirrors your own
+-- outgoing shout/yell, can reference them -- a later `local` wouldn't be in scope for it.
+local SHOUT_TEXT_COLOR = {255/255, 170/255,  60/255, 1.0} -- orange: Shout
+local YELL_TEXT_COLOR  = {255/255,  90/255, 200/255, 1.0} -- pink/magenta: Yell
+
 -- ===== Commands =====
 ashita.events.register('command', 'multichat_command_cb', function (e)
     local cmdline = e.command
@@ -717,6 +724,26 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
         local orig = cmdline:gsub('^/%a+%s+', '', 1)
         orig = clean_str(orig)
         append_message('say', me ~= '' and me or 'Me', orig, false)
+        return
+    end
+
+    -- Mirror outgoing /shout and /yell. Incoming shouts/yells are captured via text_in (modes
+    -- 10/11), but your OWN outgoing ones don't arrive that way -- same reason /say and /tell are
+    -- mirrored from the command here rather than relied on from the packet/text stream.
+    -- Confirmed via user report: a self-yell showed in the native log but not in the Sh/Y tab.
+    -- `kind` ('shout'/'yell') is set so the Both/Shout/Yell filter treats these like any other.
+    local shout_msg = lower:match('^/shout%s+(.+)$') or lower:match('^/sh%s+(.+)$')
+    if shout_msg then
+        local me = current_char_name()
+        local orig = clean_str(cmdline:gsub('^/%a+%s+', '', 1))
+        append_message('shout', me ~= '' and me or 'Me', orig, false, SHOUT_TEXT_COLOR, nil, nil, false, 'shout')
+        return
+    end
+    local yell_msg = lower:match('^/yell%s+(.+)$') or lower:match('^/y%s+(.+)$')
+    if yell_msg then
+        local me = current_char_name()
+        local orig = clean_str(cmdline:gsub('^/%a+%s+', '', 1))
+        append_message('shout', me ~= '' and me or 'Me', orig, false, YELL_TEXT_COLOR, nil, nil, false, 'yell')
         return
     end
 
@@ -849,11 +876,6 @@ local EXP_COLOR        = {110/255, 220/255, 110/255, 1.0} -- green: experience p
 local LEVEL_UP_COLOR   = EXP_COLOR                        -- green: level up
 local LEVEL_DOWN_COLOR = {255/255, 150/255, 150/255, 1.0} -- light red: level down
 local STATUS_COLOR     = {195/255, 130/255, 255/255, 1.0} -- purple: status effects landing (ailments and buffs)
-
--- Shout and Yell share one tab but are colored distinctly per-message so the two are easy to
--- tell apart at a glance even when both are shown together.
-local SHOUT_TEXT_COLOR = {255/255, 170/255,  60/255, 1.0} -- orange: Shout
-local YELL_TEXT_COLOR  = {255/255,  90/255, 200/255, 1.0} -- pink/magenta: Yell
 
 -- Default text color for the SYS tab (general system messages/broadcasts) -- an easy-to-read
 -- light purple, matching the shade FFXI's own system text traditionally uses.
