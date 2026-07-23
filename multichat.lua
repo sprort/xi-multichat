@@ -198,6 +198,11 @@ local default_config = {
     shoutyell_filter = 'both', -- 'both' | 'shout' | 'yell' -- which to show in the Shout/Yell channel
     craft_filter     = 'all', -- 'all' | 'mine' -- who to show in the Craft channel
     combat_filter    = 'all', -- 'all' | 'mine' -- who to show in the Combat channel
+    -- Per-channel popped-out state. Window positions/sizes were already persisted (in `windows`
+    -- above), which is why re-popping a window restores where it was -- but whether a channel
+    -- was popped out at all wasn't, so a reload dropped every pop-out back into the main window.
+    -- Kept in step with reality each frame and re-applied on load (see restore_popped_state).
+    popped           = {},
     colors = {
         -- per_channel = false -> use "all"; per_channel = true -> use "channels[<channel>]"
         -- Default all three to each channel's tab color.
@@ -244,6 +249,13 @@ local function apply_cfg_defaults(c)
     c.shoutyell_filter  = c.shoutyell_filter or 'both'
     if c.shoutyell_filter ~= 'shout' and c.shoutyell_filter ~= 'yell' then c.shoutyell_filter = 'both' end
 
+    -- Normalize the saved popped-out flags to real booleans, with an entry for every channel
+    -- (an older save predating this field, or a hand-edited one, may be missing or malformed).
+    c.popped = (type(c.popped) == 'table') and c.popped or {}
+    for ch, _ in pairs(pop) do
+        c.popped[ch] = (c.popped[ch] == true)
+    end
+
     c.colors = c.colors or default_config.colors
     for _, key in ipairs({'timestamp', 'username', 'text'}) do
         c.colors[key] = c.colors[key] or default_config.colors[key]
@@ -258,11 +270,25 @@ local function apply_cfg_defaults(c)
     return c
 end
 
+-- Re-applies the saved popped-out state to the live `pop` table, so channels that were popped
+-- out when you last played come back popped out (into their saved positions) instead of
+-- collapsing into the main window on reload. Takes the config table as an argument rather than
+-- reading the `cfg` local, so it can be defined ahead of it and used by both load paths below.
+local function restore_popped_state(c)
+    if type(c) ~= 'table' or type(c.popped) ~= 'table' then return end
+    for ch, state in pairs(pop) do
+        state.popped = (c.popped[ch] == true)
+        -- A restored pop-out must also be un-closed, or it'd be popped but not drawn.
+        if state.popped then state.is_open[1] = true end
+    end
+end
+
 local cfg = default_config;
 if have_settings and type(settings.load) == 'function' then
     local ok, loaded = pcall(settings.load, default_config);
     if ok and type(loaded) == 'table' and type(loaded.windows) == 'table' then
         cfg = apply_cfg_defaults(loaded);
+        restore_popped_state(cfg);
     end
 
     -- The settings library monitors character login/logout itself (via zone packets) and, on
@@ -277,6 +303,10 @@ if have_settings and type(settings.load) == 'function' then
             settings.register('settings', 'multichat_settings_sync', function (new_settings)
                 if type(new_settings) == 'table' then
                     cfg = apply_cfg_defaults(new_settings);
+                    -- The character-specific settings only actually arrive on this swap (the
+                    -- initial load above runs before a character is known), so this is where a
+                    -- saved pop-out layout really gets applied.
+                    restore_popped_state(cfg);
                 end
             end)
         end)
@@ -2486,6 +2516,14 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     end
 
     if force_center_frames > 0 then force_center_frames = force_center_frames - 1 end
+
+    -- Mirror the live popped-out state into the config so it's what gets saved. Done here, in
+    -- one place, rather than at each of the several spots that toggle it (the Pop Out/Pop In
+    -- buttons, the tab right-click menu, closing a popped window, /multichat show, /multichat
+    -- reset) -- that way none can be missed. Ten boolean assignments a frame, no allocation.
+    if type(cfg.popped) == 'table' then
+        for ch, state in pairs(pop) do cfg.popped[ch] = state.popped end
+    end
 
     local pushed_accent = push_accent_colors()
 

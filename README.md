@@ -29,7 +29,7 @@ This addon should work on any FFXI private server running Ashita v4, but it has 
 - Item names highlighted, matching how the native log styles them
 - Per-channel colored text/timestamps/brace coloring for LS1/LS2/Party/Tell/Say (other channels use fixed colors)
 - Message column aligned to the widest username actually present in that channel
-- Resizable split view (side-by-side or stacked) and multi-window pop-out — pop out as many channels at once as you like
+- Resizable split view (side-by-side or stacked) and multi-window pop-out — pop out as many channels at once as you like, and popped-out windows come back popped out (in their saved positions) after a reload or relog rather than collapsing into the main window
 - Invert-flashing alert indicator for unseen messages (visual only, no sound)
 - Click a line to copy it, or use the right-click menu to copy name/message/line
 - Duplicate-message suppression
