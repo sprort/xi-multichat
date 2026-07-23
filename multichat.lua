@@ -1,7 +1,7 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
 addon.version   = '2.0.0';
-addon.desc      = 'Multi-channel chat window for FFXI (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, and SYS tabs), hidden until a character is loaded into the world (safe for default.txt auto-load), with settings that reliably persist across sessions and a Settings panel for timestamp format (12h/24h, HH:MM[:SS]), per-channel or global colors (timestamps, usernames, chat text) for LS1/LS2/Party/Tell/Say, adjustable font size (9-45px), independent line spacing (0-8px), Craft/Combat "Everyone / Myself" filters, and a Shout/Yell "Both / Shout / Yell" filter. Craft/Combat/NPC/SYS text is colored by message type instead (abilities in yellow, damage in red, healing in light blue, system messages in light purple, and more); Shout and Yell are always colored differently from each other. SYS always flashes its tab alert on a new message, the same way Tell and Party do. Read-only: reads chat/system text already visible in your own log and reorganizes it into tabs -- never sends, blocks, or modifies any packet or message, and does not affect what other players see. Includes channel-colored buttons with active-channel highlighting, message alignment sized to the widest username actually present, pop-out windows (pop out as many channels at once as you like), resizable split view (side-by-side or stacked) with a one-click toggle, click-to-copy, adjustable whole-window transparency (also via /multichat trans 0..100), brace coloring, de-dupe, and a persistent (visual only, no sound) invert-flash alert indicator.';
+addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
 require('common');
@@ -1902,7 +1902,10 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
             elseif try_conquest_addon_message(line) then
                 -- Already fully handled inside try_conquest_addon_message.
             elseif is_conquest_update_line(line) then
-                append_message('sys', 'System', line, true)
+                -- no_alert: the server's periodic conquest broadcast is routine background
+                -- information (and arrives as a multi-line block), not something worth flashing
+                -- the tab for, unlike a genuine system broadcast.
+                append_message('sys', 'System', line, true, nil, nil, nil, true)
             elseif mode == NPC_DIALOGUE_MODE then
                 local name, body = parse_npc_dialogue_line(line, npc_speaker)
                 npc_speaker = name
