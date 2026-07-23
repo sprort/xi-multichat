@@ -43,7 +43,7 @@ Craft/Combat and Shout/Yell filters apply retroactively to messages already capt
 | `/multichat` | Toggle the window |
 | `/multichat show` | Open and re-center |
 | `/multichat reset` | Reset all window positions |
-| `/multichat trans <0-100>` | Background opacity |
+| `/multichat reload` | Reload the addon |
 | `/multichat checkupdate` | Check for a newer version |
 | `/multichat update` | Install the latest version and reload |
 

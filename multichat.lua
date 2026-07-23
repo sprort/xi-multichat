@@ -189,7 +189,7 @@ local default_config = {
         shout      = { x = 325, y = 325, w = 420, h = 360 },
         sys        = { x = 475, y = 475, w = 420, h = 360 },
     },
-    chat_bg_alpha    = 0.25,  -- chat log child background opacity (0..1) (set via /multichat trans 0..100)
+    chat_bg_alpha    = 0.25,  -- chat log child background opacity (0..1), set from the Settings window
     font_scale       = 1.0,   -- per-window text scale multiplier (0.5 .. 2.5)
     line_spacing     = 0,     -- vertical pixel gap between chat lines (0 .. 16), independent of font_scale
     dedupe_sec       = 1.5,   -- window for duplicate suppression
@@ -733,17 +733,10 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
         return
     end
 
-    -- /multichat trans <0..100>  (0 transparent, 100 opaque)
-    local tval = lower:match('^/multichat%s+trans%s+(%S+)$')
-    if tval then
+    -- /multichat reload
+    if lower:startswith('/multichat reload') then
         e.blocked = true
-        local v = tonumber(tval)
-        if v then
-            if v < 0   then v = 0   end
-            if v > 100 then v = 100 end
-            cfg.chat_bg_alpha = v / 100.0
-        end
-        chat.is_open[1] = true
+        AshitaCore:GetChatManager():QueueCommand(1, '/addon reload multichat')
         return
     end
 
