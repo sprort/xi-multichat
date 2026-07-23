@@ -1207,6 +1207,12 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- FISH_BAD_COLOR, despite losing the catch (same treatment as "You give up and reel in
     -- your line." above).
     { channel = 'craft', pattern = "^Your line breaks%.$",                              self_only = true, color = ITEM_COLOR },
+    -- Can't-fish conditions -- confirmed via in-game screenshot ("You can't fish without bait
+    -- on the hook.", "You can't fish at the moment."). Informational rather than a bite-quality
+    -- signal, so the same plain white as "You give up and reel in your line." above rather than
+    -- one of the good/neutral/bad fishing colors.
+    { channel = 'craft', pattern = "^You can't fish without bait on the hook%.$",       self_only = true, color = ITEM_COLOR },
+    { channel = 'craft', pattern = "^You can't fish at the moment%.$",                  self_only = true, color = ITEM_COLOR },
 }
 
 -- Best-effort pet/avatar/fellow name lookup for the "Me & Pets" filter. Party slot 0 is always
@@ -1341,17 +1347,21 @@ local function find_entity_by_name(name)
     if not name or name == '' then return nil end
     local lname = name:lower()
     local found
-    -- One pcall around the entire scan rather than one per GetEntity call. This loop runs up to
-    -- 2304 iterations per lookup, and a pcall per iteration is real overhead that added up badly
-    -- when many distinct actors show up in quick succession -- e.g. idling in a busy town where
-    -- lots of nearby players are casting buffs/using items, each a new combat-channel actor to
-    -- resolve. GetEntity on a valid 0..2303 index doesn't throw, so the per-call guard bought
-    -- nothing; the single outer pcall still protects against an unexpected failure.
+    -- Scans with the entity manager's direct GetName(index) accessor, which returns just the
+    -- name string, rather than the global GetEntity(index), which builds a whole entity object
+    -- per call -- 2304 of those per lookup was pure waste when all we need to compare is the
+    -- name. The full entity is only constructed for the single match. Same accessor style the
+    -- approved HXUI/luashitacast/kazenoeye addons use.
+    -- One pcall around the entire scan rather than one per call, too: a pcall per iteration is
+    -- real overhead that added up badly when many distinct actors show up in quick succession --
+    -- e.g. idling in a busy town where lots of nearby players are casting buffs/using items,
+    -- each a new combat-channel actor to resolve.
     pcall(function()
+        local em = AshitaCore:GetMemoryManager():GetEntity()
         for i = 0, 2303 do
-            local ent = GetEntity(i)
-            if ent and ent.Name and ent.Name ~= '' and ent.Name:lower() == lname then
-                found = ent
+            local n = em:GetName(i)
+            if n and n ~= '' and n:lower() == lname then
+                found = GetEntity(i)
                 return
             end
         end
