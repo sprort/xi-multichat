@@ -1617,16 +1617,19 @@ end
 -- treatment no matter what mode they happen to arrive under. Returns true if this line was one
 -- of these and has already been fully handled, false otherwise.
 local function try_broadcast_message(msg)
+    -- Username takes the same color as the message text, so the whole row reads as one
+    -- broadcast regardless of which tab it turns up in (rather than picking up each channel's
+    -- own username color). Passed explicitly as uname_color -- see draw_channel_messages.
     if msg:match("^Achievement Unlocked:") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
-            append_message(ch, 'Achievement', msg, true, ACHIEVEMENT_COLOR)
+            append_message(ch, 'Achievement', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR)
         end
         return true
     end
 
     if msg:match("^★ .- has reached level %d+ on .- as a hardcore character! ★$") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
-            append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR)
+            append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR)
         end
         return true
     end
@@ -2192,10 +2195,14 @@ local function draw_channel_messages(channel)
         -- entry.text_color is honored on every channel, not just Craft/Combat, so a broadcast
         -- message (currently just achievement unlocks) renders in the same color everywhere.
         local row_text_color = entry.text_color or text_color
-        -- Combat's enemy/player username color is resolved once at message-append time (see
-        -- resolve_combat_uname_color) and stored on the entry, rather than re-scanning the
+        -- entry.uname_color is honored on every channel, not just Combat, so a broadcast message
+        -- (achievement unlocks, hardcore milestones) keeps its own username color in whichever
+        -- tab it lands in. Only rows that explicitly stored one are affected -- resolve_uname_color
+        -- returns nil for every non-Combat channel, so everything else still falls back to the
+        -- channel default. Combat's enemy/player color is resolved once at message-append time
+        -- (see resolve_combat_uname_color) and stored on the entry, rather than re-scanning the
         -- entity table here every frame for every visible row.
-        local row_uname_color = (channel == 'combat' and entry.uname_color) or uname_color
+        local row_uname_color = entry.uname_color or uname_color
         draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, idx, msg_col_x, entry.spans, entry)
     end)
     if pushed_spacing > 0 then pcall(function() imgui.PopStyleVar(pushed_spacing) end) end
