@@ -741,6 +741,63 @@ local function history_path(pname)
     return history_dir() .. '\\' .. (pname:gsub('[^%w]', '')) .. '.lua'
 end
 
+-- ===== Session breaks =====
+-- A "session break" is a special row (is_break = true, no username/message) that renders as a red
+-- rule across the tab, marking where a logout/login or an addon reload separates the previous
+-- session's messages from this one. Kept on one table to avoid adding several top-level locals
+-- (this file sits near Lua's 200-locals-per-chunk cap). Not persisted -- on reload the restored
+-- history is one block and a single fresh break is dropped at its end; relog breaks show for the
+-- session but are replaced by that single break the next time history is restored.
+local sbreak = { color = {0.85, 0.25, 0.25, 1.0}, prev_logged_in = false }
+
+-- Append a break to every channel that has messages (skips empty tabs so there's never a leading
+-- rule), unless that channel already ends in a break (avoids a double rule when you relog without
+-- anything new arriving in between).
+function sbreak.push()
+    local now = os.time()
+    for _, buf in pairs(chat.messages) do
+        if buf.count and buf.count > 0 then
+            local last = buf:last()
+            if not (last and last.is_break) then
+                buf:push({ epoch = now, is_break = true })
+            end
+        end
+    end
+end
+
+-- Renders a break row: a red rule across the tab with the break's time centered on it, e.g.
+-- "------ 08:06:05 ------". Everything pcall-guarded; if any imgui call is unavailable it just
+-- draws the time label with no rule.
+function sbreak.draw(entry)
+    imgui.Spacing()
+    local okAv, avail = pcall(imgui.GetContentRegionAvail)
+    local w = (okAv and avail) and get_x(avail) or 200
+    local label = format_timestamp(entry.epoch or os.time())
+    local okS, sz = pcall(imgui.CalcTextSize, label)
+    local tw = okS and get_x(sz) or (#label * 7)
+    local th = okS and get_y(sz) or 14
+    local okPos, pos = pcall(imgui.GetCursorScreenPos)
+    if okPos and pos then
+        local x, y = get_x(pos), get_y(pos)
+        local cy = y + th * 0.5
+        local gap = 8
+        local leftEnd = x + (w - tw) * 0.5 - gap
+        local rightStart = x + (w + tw) * 0.5 + gap
+        local dl = imgui.GetWindowDrawList()
+        if dl then
+            local u = imgui.GetColorU32(sbreak.color)
+            if leftEnd > x then dl:AddRectFilled({x, cy}, {leftEnd, cy + 1}, u) end
+            if rightStart < x + w then dl:AddRectFilled({rightStart, cy}, {x + w, cy + 1}, u) end
+        end
+    end
+    local okCx, cx = pcall(imgui.GetCursorPosX)
+    local pad = (w - tw) * 0.5
+    if pad < 0 then pad = 0 end
+    if okCx and type(cx) == 'number' then pcall(function() imgui.SetCursorPosX(cx + pad) end) end
+    imgui.TextColored(sbreak.color, label)
+    imgui.Spacing()
+end
+
 -- Fields worth persisting: enough to redraw the row exactly (colors/spans are stored rather than
 -- recomputed, since combat coloring can't be re-resolved after a reload -- the entities aren't
 -- loaded yet). The per-frame render caches (_wrap_lines, _ts_str, ...) are deliberately omitted;
@@ -766,7 +823,7 @@ local function save_history()
             local i = 0
             buf:each(function(e)
                 i = i + 1
-                if i > first then rows[#rows + 1] = snapshot_row(e) end
+                if i > first and not e.is_break then rows[#rows + 1] = snapshot_row(e) end
             end)
             if #rows > 0 then data[ch] = rows end
         end
@@ -808,6 +865,8 @@ local function restore_history()
             end
         end
     end
+    -- Mark the boundary between everything just restored (previous sessions) and this one.
+    sbreak.push()
 end
 
 -- ===== Per-tab plain-text logging =====
@@ -2264,6 +2323,7 @@ end)
 -- everything is captured unconditionally now (see append_message's `kind` param and the
 -- Craft/Combat/Shout-Yell capture sites in process_system_line / the text_in handler).
 local function channel_row_visible(channel, entry)
+    if entry.is_break then return true end   -- session dividers ignore all channel filters
     if channel == 'craft' then return actor_matches_filter(entry.username, cfg.craft_filter)
     elseif channel == 'combat' then return actor_matches_filter(entry.username, cfg.combat_filter)
     elseif channel == 'shout' then return cfg.shoutyell_filter == 'both' or entry.kind == cfg.shoutyell_filter
@@ -2277,7 +2337,9 @@ local function copy_all(channel)
     local bucket = chat.messages[channel]
     if bucket then
         bucket:each(function (entry)
-            if channel_row_visible(channel, entry) then
+            if entry.is_break then
+                table.insert(out, '----------------------------------------')
+            elseif channel_row_visible(channel, entry) then
                 table.insert(out, string.format("%s %s: %s", format_timestamp(entry.epoch), entry.username, entry.message))
             end
         end)
@@ -2537,6 +2599,7 @@ local function draw_channel_messages(channel)
         if not channel_row_visible(channel, entry) then return end
         seen_w = seen_w + 1
         if seen_w <= skip then return end
+        if entry.is_break then return end   -- no username, contributes no column width
         if entry._uname_w_scale ~= cfg.font_scale then
             entry._uname_w = text_width(entry.username .. ':')
             entry._uname_w_scale = cfg.font_scale
@@ -2561,6 +2624,7 @@ local function draw_channel_messages(channel)
         seen_d = seen_d + 1
         if seen_d <= skip then return end
         idx = idx + 1
+        if entry.is_break then sbreak.draw(entry); return end
         if entry._ts_sig ~= ts_sig then
             entry._ts_str = format_timestamp(entry.epoch)
             entry._row_full = string.format("%s %s: %s", entry._ts_str, entry.username, entry.message)
@@ -2686,12 +2750,12 @@ local function swap_views()
     pop[split.right_channel].alert = false
 end
 
-local channel_order = {'linkshell','linkshell2','party','tell','say','shout','craft','combat','quest','sys'}
--- Subset of channel_order used by the Colors section -- Craft/Combat are excluded since their
--- colors are fixed/message-type-based rather than user-configurable (see is_system_channel).
+-- Subset of the full channel order used by the Colors section -- Craft/Combat are excluded since
+-- their colors are fixed/message-type-based rather than user-configurable (see is_system_channel).
 local colorable_channel_order = {'linkshell','linkshell2','party','tell','say'}
 local function pick_alternate_left(exclude)
-    for _,c in ipairs(channel_order) do if c ~= exclude then return c end end
+    -- LOGGABLE_ORDER doubles as the canonical full channel order (same list).
+    for _,c in ipairs(LOGGABLE_ORDER) do if c ~= exclude then return c end end
     return exclude
 end
 
@@ -3046,6 +3110,17 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- which also requires the player entity) so a zone change -- which briefly nils the entity
     -- while you stay logged in -- doesn't split your logs into a new session.
     manage_log_session(logged_in)
+
+    -- A logout->login edge while the addon stays loaded (a relog) drops a session divider into the
+    -- tabs, the same way a fresh addon load does after restoring history. Tracked on login status
+    -- alone (before the draw gate) so the logout is actually observed. The very first login after
+    -- load is left to restore_history below (history_restored is still false here), so the two
+    -- don't double up.
+    if logged_in and not sbreak.prev_logged_in and history_restored then
+        sbreak.push()
+    end
+    sbreak.prev_logged_in = logged_in
+
     pcall(ensure_log_files)   -- create empty files for selected tabs up front (shared login stamp)
     if (os.clock() - last_log_flush) >= LOG_FLUSH_INTERVAL then
         last_log_flush = os.clock()

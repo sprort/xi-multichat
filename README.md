@@ -31,6 +31,7 @@ Built and tested on HorizonXI; should work on any Ashita v4 server.
 - Flashing alert for unseen messages (visual only, no sound); click a line to copy it
 - 5000 lines per channel, duplicate suppression, settings persist across sessions
 - Optional history restore across reloads/relogs, and optional per-tab plain-text logs (see below)
+- A red divider marks each session break (logout/login or addon reload), separating the previous session from the current one
 - Stays hidden until you're logged in — safe to auto-load from `default.txt`
 
 **Settings** (⚙): transparency, font size, line spacing, timestamp format, and per-channel or global colors.
