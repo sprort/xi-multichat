@@ -630,10 +630,12 @@ local function append_message(channel, username, msg, is_incoming, text_color, u
     -- Name-mention detection, once: drives both the tab alert (below) and the line highlight
     -- (entry.mention -> row tint; name spans -> bright name). Bright-name spans are appended to
     -- whatever spans the caller already passed (e.g. an item highlight), so a line can carry
-    -- both.
+    -- both. Skipped when you are the actor (username is your own name), so your own actions --
+    -- e.g. casting a spell on yourself, "Sprort starts casting Warp on Sprort." where the target
+    -- is also you -- don't alert or highlight you as if someone else had named you.
     local mention = false
     local pname = cached_player_name()
-    if pname ~= '' then
+    if pname ~= '' and username:lower() ~= pname:lower() then
         local nspans = find_name_spans(msg, pname)
         if nspans then
             mention = true
