@@ -519,6 +519,46 @@ local function current_char_name()
     return AshitaCore:GetMemoryManager():GetParty():GetMemberName(0) or ''
 end
 
+-- Cached player name for the per-message name-mention check below -- current_char_name reads
+-- memory each call, and the mention check now runs on every captured message, so this refreshes
+-- only every few seconds (the name only changes on login/character switch) instead of per message.
+local player_name_cache, player_name_cache_t = '', -100
+local function cached_player_name()
+    local now = os.clock()
+    if player_name_cache == '' or (now - player_name_cache_t) > 3.0 then
+        player_name_cache = current_char_name()
+        player_name_cache_t = now
+    end
+    return player_name_cache
+end
+
+-- Highlighting for a line that mentions your name (paired with the tab alert): the name itself
+-- is drawn in a bright color, and the whole row gets a faint background tint. First-pass colors,
+-- easy to tweak.
+local MENTION_NAME_COLOR = {255/255, 240/255, 120/255, 1.0}  -- bright yellow: your name in the text
+local MENTION_TINT_COLOR = {255/255, 225/255, 120/255, 0.10} -- faint warm wash behind the row
+
+-- Finds whole-word (case-insensitive) occurrences of `name` in `text`, as {s, e} char ranges.
+-- Whole-word so a name that's a prefix of a longer word (e.g. "Sprort" inside "Sprortacus")
+-- isn't half-highlighted. Returns nil if there are none.
+local function find_name_spans(text, name)
+    if not name or name == '' then return nil end
+    local ltext, lname = text:lower(), name:lower()
+    local spans, init = nil, 1
+    while true do
+        local s, e = ltext:find(lname, init, true)
+        if not s then break end
+        local before = (s > 1) and ltext:sub(s - 1, s - 1) or ''
+        local after  = (e < #ltext) and ltext:sub(e + 1, e + 1) or ''
+        if before:match('%w') == nil and after:match('%w') == nil then
+            spans = spans or {}
+            table.insert(spans, { s = s, e = e })
+        end
+        init = e + 1
+    end
+    return spans
+end
+
 -- Treat both panes as "viewed"; only alert if not visible in main-left or main-right.
 local function channel_visible_in_main(channel)
     if chat.active_channel == channel and not pop[channel].popped then return true end
@@ -526,14 +566,15 @@ local function channel_visible_in_main(channel)
     return false
 end
 
--- Triggers for both incoming AND outgoing messages.
-local function mark_alert_if_needed(channel, msg, _is_incoming_unused)
+-- `mention` is whether the message names you (computed once in append_message). Tell/Party/SYS
+-- always alert; every other channel alerts only on a name mention.
+local function mark_alert_if_needed(channel, mention)
+    -- A popped-out channel has its own visible window, so there's nothing to flash for -- never
+    -- alert it (neither its pop-out window nor its main-window tab button).
+    if pop[channel].popped then return end
     if channel_visible_in_main(channel) then return end
     if channel == 'tell' or channel == 'party' or channel == 'sys' then pop[channel].alert = true; return end
-    local who = current_char_name()
-    if who ~= '' and msg:lower():find(who:lower(), 1, true) then
-        pop[channel].alert = true
-    end
+    if mention then pop[channel].alert = true end
 end
 
 local function is_alerting(channel) return pop[channel].alert == true end
@@ -585,9 +626,27 @@ local function append_message(channel, username, msg, is_incoming, text_color, u
     if not no_dedupe and is_duplicate_and_mark(channel, username, msg) then return end
     local bucket = chat.messages[channel]
     if not bucket then return end
-    bucket:push({ epoch = os.time(), username = username, message = msg, text_color = text_color, uname_color = uname_color, spans = spans, kind = kind })
+
+    -- Name-mention detection, once: drives both the tab alert (below) and the line highlight
+    -- (entry.mention -> row tint; name spans -> bright name). Bright-name spans are appended to
+    -- whatever spans the caller already passed (e.g. an item highlight), so a line can carry
+    -- both.
+    local mention = false
+    local pname = cached_player_name()
+    if pname ~= '' then
+        local nspans = find_name_spans(msg, pname)
+        if nspans then
+            mention = true
+            spans = spans or {}
+            for _, sp in ipairs(nspans) do
+                table.insert(spans, { s = sp.s, e = sp.e, color = MENTION_NAME_COLOR })
+            end
+        end
+    end
+
+    bucket:push({ epoch = os.time(), username = username, message = msg, text_color = text_color, uname_color = uname_color, spans = spans, kind = kind, mention = mention })
     if not no_alert then
-        mark_alert_if_needed(channel, msg, is_incoming)
+        mark_alert_if_needed(channel, mention)
     end
 end
 
@@ -2107,7 +2166,30 @@ local function draw_colored_username(uname, ucolor)
 end
 
 -- Draw one row (copy on click + context)
-local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, spans, cache_entry)
+local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, spans, cache_entry, tint_color)
+    -- Row background tint for name-mention lines. The row's height isn't known until it's drawn
+    -- (wrapped rows vary), and a rect added to the draw list after the text would cover it, so
+    -- the tint is drawn *before* the content using the height measured on the previous frame
+    -- (cached on the entry). A mention row is rare and persists, so the one-frame delay before
+    -- the tint appears is imperceptible. Everything guarded -- if any imgui call is unavailable
+    -- the row just draws without a tint.
+    local tint_top_y
+    if tint_color then
+        local okPos, pos = pcall(imgui.GetCursorScreenPos)
+        if okPos and pos then
+            tint_top_y = get_y(pos)
+            if cache_entry and cache_entry._row_h then
+                pcall(function()
+                    local avail = imgui.GetContentRegionAvail()
+                    local w = get_x(avail)
+                    imgui.GetWindowDrawList():AddRectFilled(
+                        { get_x(pos), tint_top_y },
+                        { get_x(pos) + w, tint_top_y + cache_entry._row_h },
+                        imgui.GetColorU32(tint_color))
+                end)
+            end
+        end
+    end
     imgui.TextColored(ts_color, timestamp); imgui.SameLine()
     draw_colored_username(uname, ucolor); imgui.SameLine(msg_col_x)
     imgui.PushID(row_id)
@@ -2123,6 +2205,12 @@ local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color,
         imgui.EndPopup()
     end
     imgui.PopID()
+    -- Cache this row's drawn height for next frame's tint (see the top of this function). Only
+    -- measured for mention rows, so ordinary rows pay nothing.
+    if tint_color and tint_top_y and cache_entry then
+        local okPos, pos = pcall(imgui.GetCursorScreenPos)
+        if okPos and pos then cache_entry._row_h = get_y(pos) - tint_top_y end
+    end
 end
 
 -- Craft/Combat don't use the user-configurable color settings -- their username/timestamp
@@ -2210,7 +2298,8 @@ local function draw_channel_messages(channel)
         -- (see resolve_combat_uname_color) and stored on the entry, rather than re-scanning the
         -- entity table here every frame for every visible row.
         local row_uname_color = entry.uname_color or uname_color
-        draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, idx, msg_col_x, entry.spans, entry)
+        local tint = entry.mention and MENTION_TINT_COLOR or nil
+        draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, idx, msg_col_x, entry.spans, entry, tint)
     end)
     if pushed_spacing > 0 then pcall(function() imgui.PopStyleVar(pushed_spacing) end) end
 end
