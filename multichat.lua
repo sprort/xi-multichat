@@ -36,17 +36,14 @@ print(string.format('[%s] v%s loaded. Type /multichat to toggle the window (Sett
 -- RingBuffer below), whose eviction is O(1) regardless of size, so this can be sized generously
 -- (enough to review a whole fight or conversation afterward) without a growing per-message cost.
 local MAX_MESSAGES_PER_CHANNEL = 5000;
--- How many of a channel's most recent (visible-after-filter) messages are actually drawn per
--- frame. Storage stays at MAX_MESSAGES_PER_CHANNEL above (so Copy still grabs the whole
--- history), but the per-frame render cost -- ImGui draw calls plus per-row string/timestamp
--- work -- scales with what's *drawn*, not what's stored. Rendering all 5000 was the cause of a
--- severe FPS drop reported after ~30 min in a leveling party, once Combat's buffer filled:
--- every frame was emitting thousands of off-screen rows' worth of draw calls and os.date/
--- string.format allocations. Only the last few hundred lines are realistically scrolled through
--- live anyway (deep review is better served by the copy-out and the planned on-disk log), so
--- this bounds the live render window while leaving stored history untouched. Raise it for more
--- in-window scrollback at some per-frame cost.
-local MAX_RENDERED_ROWS = 500;
+-- How deep a channel's in-window scrollback goes -- the size of the working set the renderer
+-- considers each frame. This used to be small (500) because the old renderer drew every row in
+-- the working set, so a big set meant thousands of off-screen draw calls (the leveling-party FPS
+-- drop). The renderer now VIRTUALIZES -- it only emits the ~30 rows actually in the viewport and
+-- reserves the rest as empty space (see draw_channel_messages) -- so the working set can be the
+-- whole stored buffer at no draw cost. The per-frame walk over it is arithmetic only and reuses a
+-- scratch array (no allocation), so the practical cost of raising this is negligible.
+local MAX_RENDERED_ROWS = MAX_MESSAGES_PER_CHANNEL;
 -- Reference point size the Font Size slider displays against. cfg.font_scale (the value actually
 -- passed to imgui.SetWindowFontScale) is stored as a ratio, not an absolute size, since Ashita's
 -- loaded font(s) are whatever size(s) the player's own boot profile configured; this is purely
@@ -2642,11 +2639,17 @@ local function draw_channel_messages(channel)
         text_color   = resolve_color(cfg.colors.text, channel, {1,1,1,1})
     end
 
-    -- Only the last MAX_RENDERED_ROWS visible rows are ever drawn. When the tab's filter shows
-    -- everything (the default for every tab), every row is visible, so we can skip straight to the
-    -- tail with each_range instead of walking the whole (up to 5000-row) buffer three times a
-    -- frame -- the walk was the source of the slowdown as a busy tab filled up. Only Craft/Combat
-    -- with a "Myself" filter, or Shout/Yell narrowed to one type, still needs the per-row scan.
+    -- ImGui is immediate-mode: it runs the CPU layout cost for every row you emit, even ones
+    -- scrolled out of view. To keep a long log at full framerate we VIRTUALIZE -- emit only the
+    -- rows whose vertical span intersects the visible viewport (~a few dozen), and reserve the
+    -- space above/below them by advancing the cursor, so the scrollbar and scroll position stay
+    -- correct. Row heights vary (long messages wrap), so each row's drawn height is measured and
+    -- cached per width; a not-yet-measured row falls back to one line and self-corrects the first
+    -- time it scrolls into view.
+
+    -- Which rows are displayable. When the tab's filter shows everything (the default), that's the
+    -- last MAX_RENDERED_ROWS rows outright; only Craft/Combat set to "Myself", or Shout/Yell
+    -- narrowed to one type, needs the per-row visibility scan.
     local permissive = true
     if channel == 'craft' then permissive = (cfg.craft_filter == 'all')
     elseif channel == 'combat' then permissive = (cfg.combat_filter == 'all')
@@ -2654,75 +2657,121 @@ local function draw_channel_messages(channel)
 
     local visible_count
     if permissive then
-        visible_count = bucket.count           -- everything is visible -> O(1)
+        visible_count = bucket.count
     else
         visible_count = 0
-        bucket:each(function (entry) if channel_row_visible(channel, entry) then visible_count = visible_count + 1 end end)
+        bucket:each(function (e) if channel_row_visible(channel, e) then visible_count = visible_count + 1 end end)
     end
     local skip = visible_count - MAX_RENDERED_ROWS
     if skip < 0 then skip = 0 end
 
-    -- Runs `fn` over exactly the rows being rendered (the last MAX_RENDERED_ROWS visible ones). In
-    -- the permissive case the rendered rows are the logical tail [skip .. end], so each_range walks
-    -- only those; otherwise fall back to scanning and counting visible rows past `skip`.
-    local function each_rendered(fn)
-        if permissive then
-            bucket:each_range(skip, fn)
-        else
-            local seen = 0
-            bucket:each(function (entry)
-                if not channel_row_visible(channel, entry) then return end
-                seen = seen + 1
-                if seen > skip then fn(entry) end
-            end)
-        end
+    -- Materialize the working set (the last MAX_RENDERED_ROWS displayable rows) into an array so we
+    -- can index/measure it. Reuses a scratch array persisted on `chat` so this allocates nothing
+    -- per frame -- important now that the set can be the whole buffer. `n` is the true length;
+    -- stale slots left past it by a previous, longer channel are ignored. Arithmetic only (no
+    -- ImGui/text work), and draw_channel_messages is never re-entered mid-call, so sharing is safe.
+    chat._vrows = chat._vrows or {}
+    local rows = chat._vrows
+    local n = 0
+    if permissive then
+        bucket:each_range(skip, function (e) n = n + 1; rows[n] = e end)
+    else
+        local seen = 0
+        bucket:each(function (e)
+            if not channel_row_visible(channel, e) then return end
+            seen = seen + 1
+            if seen > skip then n = n + 1; rows[n] = e end
+        end)
     end
 
-    -- Fixed column start for message text: measured from the current timestamp format's width plus
-    -- the widest username among the rows actually being rendered, so message text lines up across
-    -- all visible rows without reserving space for names that aren't shown.
-    local ts_w = text_width(get_timestamp())
-    local max_name_w = 0
-    -- Username width only needs recomputing when the font scale changes (CalcTextSize depends on
-    -- it); a username never changes after a row is created. Cached on the entry.
-    each_rendered(function (entry)
-        if entry.is_break then return end   -- no username, contributes no column width
-        if entry._uname_w_scale ~= cfg.font_scale then
-            entry._uname_w = text_width(entry.username .. ':')
-            entry._uname_w_scale = cfg.font_scale
-        end
-        if entry._uname_w > max_name_w then max_name_w = entry._uname_w end
-    end)
-    local msg_col_x = ts_w + 8 + max_name_w + 8
-
-    -- Timestamp-format signature: the formatted timestamp string and the full "ts name: msg" copy
-    -- string are cached per entry and only rebuilt when this changes, rather than calling os.date +
-    -- string.format for every drawn row every frame. Username and message never change after
-    -- creation, so the timestamp format is the only thing that can invalidate them.
-    local ts_sig = (cfg.timestamp_12h and '12' or '24') .. (cfg.timestamp_format or 'hms')
-
-    local idx = 0
     local pushed_spacing = 0
     if pcall(function() imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {8, cfg.line_spacing or 4}) end) then pushed_spacing = 1 end
-    each_rendered(function (entry)
-        idx = idx + 1
-        if entry.is_break then sbreak.draw(entry); return end
-        if entry._ts_sig ~= ts_sig then
-            entry._ts_str = format_timestamp(entry.epoch)
-            entry._row_full = string.format("%s %s: %s", entry._ts_str, entry.username, entry.message)
-            entry._ts_sig = ts_sig
+
+    -- Frame geometry, all in the child's CONTENT-space (0 = content top), the same space the
+    -- caller's auto-scroll already uses via GetScrollY. A row at content-Y `c` is on screen when
+    -- c is within [scroll, scroll+windowHeight]; we widen that by a margin so a few extra rows are
+    -- ready as you scroll. GetWindowPos/screen coords are deliberately avoided -- they didn't line
+    -- up in this binding (the whole list classified as off-screen, hence blank-but-scrollable).
+    local availx = 0
+    do local ok, a = pcall(imgui.GetContentRegionAvail); if ok and a then availx = get_x(a) end end
+    local startY = 0
+    do local ok, p = pcall(imgui.GetCursorPos); if ok and p then startY = get_y(p) end end
+    local scrollY = 0; pcall(function() scrollY = imgui.GetScrollY() end)
+    local winH = 0; pcall(function() winH = imgui.GetWindowHeight() end)
+    if winH <= 0 then winH = 400 end
+    local lineH = 0; pcall(function() lineH = imgui.GetTextLineHeightWithSpacing() end)
+    if lineH <= 0 then lineH = 18 end
+    local margin = lineH * 4
+    local viewTop = scrollY - margin
+    local viewBot = scrollY + winH + margin
+
+    -- Column start: widest username across the whole working set (cached width per entry), so the
+    -- message column doesn't jump as differently-sized names scroll into view.
+    local ts_w = text_width(get_timestamp())
+    local max_name_w = 0
+    for i = 1, n do
+        local entry = rows[i]
+        if not entry.is_break then
+            if entry._uname_w_scale ~= cfg.font_scale then
+                entry._uname_w = text_width(entry.username .. ':')
+                entry._uname_w_scale = cfg.font_scale
+            end
+            if entry._uname_w and entry._uname_w > max_name_w then max_name_w = entry._uname_w end
         end
-        -- entry.text_color is honored on every channel, not just Craft/Combat, so a broadcast
-        -- message (currently just achievement unlocks) renders in the same color everywhere.
-        local row_text_color = entry.text_color or text_color
-        -- entry.uname_color is honored on every channel, not just Combat, so a broadcast message
-        -- (achievement unlocks, hardcore milestones) keeps its own username color in whichever tab
-        -- it lands in. Combat's enemy/player color is resolved once at message-append time (see
-        -- resolve_combat_uname_color) and stored on the entry, not re-scanned here every frame.
-        local row_uname_color = entry.uname_color or uname_color
-        local tint = entry.mention and MENTION_TINT_COLOR or nil
-        draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, idx, msg_col_x, entry.spans, entry, tint)
-    end)
+    end
+    local msg_col_x = ts_w + 8 + max_name_w + 8
+    local ts_sig = (cfg.timestamp_12h and '12' or '24') .. (cfg.timestamp_format or 'hms')
+
+    -- Pass 1 (arithmetic only): sum heights to find the visible slice + the spacer heights.
+    local function row_h(entry)
+        if entry._row_h and entry._row_h_w == availx and entry._row_h > 0 then return entry._row_h end
+        return lineH
+    end
+    local y = startY
+    local topSpacer, botSpacer = 0, 0
+    local firstVis, lastVis
+    for i = 1, n do
+        local h = row_h(rows[i])
+        if (y + h) < viewTop then
+            topSpacer = topSpacer + h
+        elseif y > viewBot then
+            botSpacer = botSpacer + h
+        else
+            if not firstVis then firstVis = i end
+            lastVis = i
+        end
+        y = y + h
+    end
+
+    -- Pass 2: reserve the space above with a Dummy, draw only the visible slice (measuring each
+    -- row's real height), then reserve the space below -- so the total content height (hence the
+    -- scrollbar) still reflects the full list even though most rows are never emitted.
+    if topSpacer > 0 then pcall(function() imgui.Dummy({1, topSpacer}) end) end
+    if firstVis then
+        for i = firstVis, lastVis do
+            local entry = rows[i]
+            local y0; do local ok, p = pcall(imgui.GetCursorPos); if ok and p then y0 = get_y(p) end end
+            if entry.is_break then
+                sbreak.draw(entry)
+            else
+                if entry._ts_sig ~= ts_sig then
+                    entry._ts_str = format_timestamp(entry.epoch)
+                    entry._row_full = string.format("%s %s: %s", entry._ts_str, entry.username, entry.message)
+                    entry._ts_sig = ts_sig
+                end
+                local row_text_color = entry.text_color or text_color
+                local row_uname_color = entry.uname_color or uname_color
+                local tint = entry.mention and MENTION_TINT_COLOR or nil
+                draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, i, msg_col_x, entry.spans, entry, tint)
+            end
+            if y0 then
+                local y1; do local ok, p = pcall(imgui.GetCursorPos); if ok and p then y1 = get_y(p) end end
+                if y1 and y1 > y0 then entry._row_h = y1 - y0; entry._row_h_w = availx end
+            end
+        end
+    end
+    if botSpacer > 0 then pcall(function() imgui.Dummy({1, botSpacer}) end) end
+
     if pushed_spacing > 0 then pcall(function() imgui.PopStyleVar(pushed_spacing) end) end
 end
 
