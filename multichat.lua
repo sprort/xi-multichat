@@ -198,6 +198,7 @@ local default_config = {
     shoutyell_filter = 'both', -- 'both' | 'shout' | 'yell' -- which to show in the Shout/Yell channel
     craft_filter     = 'all', -- 'all' | 'mine' -- who to show in the Craft channel
     combat_filter    = 'all', -- 'all' | 'mine' -- who to show in the Combat channel
+    persist_history  = true,  -- snapshot recent history to a per-character file, restore on load
     -- Per-channel popped-out state. Window positions/sizes were already persisted (in `windows`
     -- above), which is why re-popping a window restores where it was -- but whether a channel
     -- was popped out at all wasn't, so a reload dropped every pop-out back into the main window.
@@ -248,6 +249,7 @@ local function apply_cfg_defaults(c)
     if c.combat_filter ~= 'mine' then c.combat_filter = 'all' end
     c.shoutyell_filter  = c.shoutyell_filter or 'both'
     if c.shoutyell_filter ~= 'shout' and c.shoutyell_filter ~= 'yell' then c.shoutyell_filter = 'both' end
+    if c.persist_history == nil then c.persist_history = true end
 
     -- Normalize the saved popped-out flags to real booleans, with an entry for every channel
     -- (an older save predating this field, or a hand-edited one, may be missing or malformed).
@@ -657,6 +659,125 @@ local function append_message(channel, username, msg, is_incoming, text_color, u
     end
 end
 
+-- ===== Persistent history (survive reload / relog / clean exit) =====
+-- Snapshots each channel's recent lines to a per-character file so a reload or restart doesn't
+-- empty your tabs. Restored once on the first frame after the character is known. Writes are
+-- batched (on unload + a periodic timer), never per message -- same discipline as everything
+-- else, so this can't reintroduce per-message cost.
+local HISTORY_SAVE_PER_CHANNEL = 500 -- cap per channel; bounds file size and save cost
+local HISTORY_SAVE_INTERVAL    = 300 -- seconds between periodic saves (covers a crash, which
+                                     -- fires no unload); the important save is still on unload
+
+-- Minimal Lua-literal serializer for the plain data stored per row (numbers, booleans, strings,
+-- arrays, string-keyed maps -- covering username/message/colors/spans/kind/mention). Strings go
+-- through %q so quotes, backslashes, and the embedded newlines FFXI puts in some messages are
+-- escaped correctly and load back intact.
+local function serialize_value(v)
+    local t = type(v)
+    if t == 'number' then return string.format('%.14g', v)
+    elseif t == 'boolean' then return v and 'true' or 'false'
+    elseif t == 'string' then return string.format('%q', v)
+    elseif t == 'table' then
+        local n, is_array = 0, true
+        for k in pairs(v) do
+            n = n + 1
+            if type(k) ~= 'number' then is_array = false end
+        end
+        local parts = {}
+        if is_array and n == #v then
+            for i = 1, #v do parts[i] = serialize_value(v[i]) end
+        else
+            for k, val in pairs(v) do
+                local key
+                if type(k) == 'string' and k:match('^[%a_][%w_]*$') then key = k
+                else key = '[' .. serialize_value(k) .. ']' end
+                parts[#parts + 1] = key .. '=' .. serialize_value(val)
+            end
+        end
+        return '{' .. table.concat(parts, ',') .. '}'
+    end
+    return 'nil'
+end
+
+local function history_dir()
+    local base = AshitaCore:GetInstallPath()
+    local sep = (base:sub(-1) == '\\' or base:sub(-1) == '/') and '' or '\\'
+    return base .. sep .. 'config\\addons\\multichat\\history'
+end
+-- FFXI names are alphanumeric; strip anything else defensively so the filename is always safe.
+local function history_path(pname)
+    return history_dir() .. '\\' .. (pname:gsub('[^%w]', '')) .. '.lua'
+end
+
+-- Fields worth persisting: enough to redraw the row exactly (colors/spans are stored rather than
+-- recomputed, since combat coloring can't be re-resolved after a reload -- the entities aren't
+-- loaded yet). The per-frame render caches (_wrap_lines, _ts_str, ...) are deliberately omitted;
+-- they rebuild on first draw.
+local function snapshot_row(e)
+    return {
+        epoch = e.epoch, username = e.username, message = e.message,
+        text_color = e.text_color, uname_color = e.uname_color,
+        spans = e.spans, kind = e.kind, mention = e.mention,
+    }
+end
+
+local function save_history()
+    if not cfg.persist_history then return end
+    local pname = current_char_name()
+    if pname == '' then return end
+    local data = {}
+    for ch, buf in pairs(chat.messages) do
+        if buf.count and buf.count > 0 then
+            local rows, first = {}, 0
+            -- keep only the last HISTORY_SAVE_PER_CHANNEL
+            if buf.count > HISTORY_SAVE_PER_CHANNEL then first = buf.count - HISTORY_SAVE_PER_CHANNEL end
+            local i = 0
+            buf:each(function(e)
+                i = i + 1
+                if i > first then rows[#rows + 1] = snapshot_row(e) end
+            end)
+            if #rows > 0 then data[ch] = rows end
+        end
+    end
+    local ok, str = pcall(serialize_value, data)
+    if not ok or not str then return end
+    pcall(function() os.execute(string.format('mkdir "%s" 2>nul', history_dir())) end)
+    local f = io.open(history_path(pname), 'w')
+    if f then
+        f:write('return ' .. str)
+        f:close()
+    end
+end
+
+local function restore_history()
+    if not cfg.persist_history then return end
+    local pname = current_char_name()
+    if pname == '' then return end
+    local f = io.open(history_path(pname), 'r')
+    if not f then return end
+    local content = f:read('*a'); f:close()
+    if not content or content == '' then return end
+    local loader = loadstring or load
+    local ok, chunk = pcall(loader, content)
+    if not ok or not chunk then return end
+    local ok2, data = pcall(chunk)
+    if not ok2 or type(data) ~= 'table' then return end
+    for ch, rows in pairs(data) do
+        local buf = chat.messages[ch]
+        if buf and type(rows) == 'table' then
+            for _, e in ipairs(rows) do
+                if type(e) == 'table' and type(e.message) == 'string' then
+                    buf:push({
+                        epoch = e.epoch or os.time(), username = e.username or '', message = e.message,
+                        text_color = e.text_color, uname_color = e.uname_color,
+                        spans = e.spans, kind = e.kind, mention = e.mention,
+                    })
+                end
+            end
+        end
+    end
+end
+
 -- ===== In-game update checking =====
 -- Reports into SYS (username "MultiChat") rather than a plain /echo, so it's visible in the
 -- same history as everything else. Only an actual available update triggers SYS's normal
@@ -697,6 +818,8 @@ end
 
 local update_available_version = nil
 local update_check_done = false
+local history_restored = false
+local last_history_save = 0
 
 local function check_for_update()
     local remote = fetch_remote_version()
@@ -2600,6 +2723,7 @@ end
 
 -- Persist on unload
 ashita.events.register('unload', 'unload_cb', function ()
+    pcall(save_history)
     if have_settings and type(settings.save) == 'function' then
         pcall(settings.save)
     end
@@ -2623,6 +2747,18 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     if not update_check_done then
         update_check_done = true
         pcall(check_for_update)
+    end
+
+    -- Restore saved history once, the first frame the character is known (buffers are still
+    -- empty here -- nothing's arrived yet post-login -- so restored rows land in order), then
+    -- save periodically so a crash (which fires no unload) loses at most one interval.
+    if not history_restored then
+        history_restored = true
+        pcall(restore_history)
+        last_history_save = os.clock()
+    elseif (os.clock() - last_history_save) >= HISTORY_SAVE_INTERVAL then
+        last_history_save = os.clock()
+        pcall(save_history)
     end
 
     if force_center_frames > 0 then force_center_frames = force_center_frames - 1 end
