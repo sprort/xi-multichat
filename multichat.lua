@@ -112,6 +112,8 @@ local chat = {
 -- Settings window UI state
 local settings_ui = {
     is_open = { false },
+    category = 1,   -- selected left-sidebar section (see settings_categories)
+    subtab = {},    -- [category index] = selected top-tab index within that section
 }
 
 -- Measured width (in pixels) of the main window's Pop Out/Split/Copy/Settings button cluster,
@@ -200,6 +202,11 @@ local default_config = {
     combat_filter    = 'all', -- 'all' | 'mine' -- who to show in the Combat channel
     persist_history  = true,  -- snapshot recent history to a per-character file, restore on load
     enable_logging   = false, -- append every captured line to per-tab, per-session text logs on disk
+    -- Which tabs to write logs for when logging is enabled (channel -> bool). All OFF by default --
+    -- turning on "write logs to disk" is a deliberate step, and choosing which tabs to log is a
+    -- second deliberate step; nothing is logged until you pick tabs. Normalized in apply_cfg_defaults.
+    log_channels     = { linkshell=false, linkshell2=false, party=false, tell=false, say=false,
+                         shout=false, craft=false, combat=false, quest=false, sys=false },
     -- Per-channel popped-out state. Window positions/sizes were already persisted (in `windows`
     -- above), which is why re-popping a window restores where it was -- but whether a channel
     -- was popped out at all wasn't, so a reload dropped every pop-out back into the main window.
@@ -252,6 +259,13 @@ local function apply_cfg_defaults(c)
     if c.shoutyell_filter ~= 'shout' and c.shoutyell_filter ~= 'yell' then c.shoutyell_filter = 'both' end
     if c.persist_history == nil then c.persist_history = true end
     if c.enable_logging == nil then c.enable_logging = false end
+
+    -- Per-tab logging selection: ensure a real boolean for every loggable channel. Missing entries
+    -- default to false -- you opt each tab in explicitly after enabling "write logs to disk".
+    c.log_channels = (type(c.log_channels) == 'table') and c.log_channels or {}
+    for ch, _ in pairs(default_config.log_channels) do
+        c.log_channels[ch] = (c.log_channels[ch] == true)
+    end
 
     -- Normalize the saved popped-out flags to real booleans, with an entry for every channel
     -- (an older save predating this field, or a hand-edited one, may be missing or malformed).
@@ -399,6 +413,12 @@ local function apply_window_bounds(key)
     if force_center_frames > 0 then
         center_window_rect(key)                         -- compute fresh centered rect
         imgui.SetNextWindowPos({ r.x, r.y }, ImGuiCond_Always)  -- force just while recentering
+        -- Also force size and expand the window while recentering. A window that ended up
+        -- off-screen, zero-sized, or collapsed in ImGui's own persisted state can't be reached
+        -- with the mouse; /multichat show|reset must be able to yank it back regardless of that
+        -- state, so we override all three (not just position) for the recenter frames.
+        pcall(function() imgui.SetNextWindowSize({ r.w, r.h }, ImGuiCond_Always) end)
+        pcall(function() imgui.SetNextWindowCollapsed(false, ImGuiCond_Always) end)
     else
         imgui.SetNextWindowPos({ r.x, r.y }, ImGuiCond_FirstUseEver) -- only first time
     end
@@ -791,11 +811,12 @@ local function restore_history()
 end
 
 -- ===== Per-tab plain-text logging =====
--- Appends every captured line to a text file per tab, under
--- config/addons/multichat/logs/<Character>/<YYYY-MM-DD>/<Tab>_<HHMMSS>.txt, where HHMMSS is the
--- session's login time so multiple logins the same day each get their own set. Off by default
--- (see cfg.enable_logging). Lines are buffered in memory and flushed on a timer + logout +
--- unload -- never a file write per message.
+-- Appends every captured line to ONE text file per tab per day, under
+-- config/addons/multichat/logs/<Character>/<YYYY-MM-DD>/<Tab>.txt. Multiple logins the same day
+-- append to the same files, each session separated by a divider line stamped with the login time,
+-- so a day's folder holds ~10 files (one per selected tab) rather than a fresh set per login. Off
+-- by default (see cfg.enable_logging). Lines are buffered in memory and flushed on a timer +
+-- logout + unload -- never a file write per message.
 local LOG_FLUSH_INTERVAL = 5 -- seconds between buffer flushes
 
 -- Readable, filename-safe tab names (channelLabels has "Sh/Y" and "LS1"/"LS2" abbreviations;
@@ -804,42 +825,60 @@ local LOG_CHANNEL_NAME = {
     linkshell = 'LS1', linkshell2 = 'LS2', party = 'Party', tell = 'Tell', say = 'Say',
     shout = 'ShoutYell', craft = 'Craft', combat = 'Combat', quest = 'NPC', sys = 'SYS',
 }
+-- Stable order for creating files and drawing the per-tab checkboxes.
+local LOGGABLE_ORDER = { 'linkshell', 'linkshell2', 'party', 'tell', 'say', 'shout', 'craft', 'combat', 'quest', 'sys' }
 
 local log_buffers = {}          -- channel -> array of pending formatted lines
 local log_session_active = false
 local log_session_char = ''
 local log_session_date = ''     -- YYYY-MM-DD at login
-local log_session_stamp = ''    -- HHMMSS at login
+local log_session_time = ''     -- HH:MM:SS at login (for the session divider)
 local log_dir_made = false      -- mkdir the session folder once, not on every flush
+local log_headed = {}           -- channel -> true once this session's divider is written
 
 local function log_session_dir()
     return string.format('%s\\logs\\%s\\%s', config_base_dir(),
         (log_session_char:gsub('[^%w]', '')), log_session_date)
 end
 local function log_file_path(channel)
-    return string.format('%s\\%s_%s.txt', log_session_dir(), (LOG_CHANNEL_NAME[channel] or channel), log_session_stamp)
+    return string.format('%s\\%s.txt', log_session_dir(), (LOG_CHANNEL_NAME[channel] or channel))
 end
 
--- Queue a captured line for its tab's log (cheap: format + append to an in-memory buffer). The
--- actual file write happens later in flush_logs. Assigns to the forward-declared local above so
--- append_message (defined earlier) can call it.
-function queue_log(channel, epoch, username, message)
-    if not cfg.enable_logging or not log_session_active then return end
-    if not LOG_CHANNEL_NAME[channel] then return end
-    local buf = log_buffers[channel]
-    if not buf then buf = {}; log_buffers[channel] = buf end
-    -- Collapse any embedded newlines (FFXI's 0x07 -> \n) so each entry stays one log line.
-    local oneline = message:gsub('[\r\n]+', ' ')
-    buf[#buf + 1] = string.format('[%s] %s: %s', os.date('%H:%M:%S', epoch), username, oneline)
+-- Writes this session's divider to a tab's file (once per session per tab), creating the file (and
+-- the day's folder) if needed. Marking the session up front here is what gives every selected tab a
+-- file the moment you log in -- even one that never receives a line -- and cleanly separates
+-- back-to-back logins that share the same day's file.
+local function write_log_header(channel)
+    if log_headed[channel] then return end
+    if not log_dir_made then   -- mkdir the day's folder once per session, not per file/flush
+        pcall(function() os.execute(string.format('mkdir "%s" 2>nul', log_session_dir())) end)
+        log_dir_made = true
+    end
+    local f = io.open(log_file_path(channel), 'a')
+    if f then
+        f:write(string.format('===== login %s %s =====\n', log_session_date, log_session_time))
+        f:close()
+    end
+    log_headed[channel] = true
+end
+
+-- Runs every frame while logging is on: makes sure each selected tab's file exists (with this
+-- session's divider) from login, rather than only appearing when its first line happens to arrive.
+-- Once every selected tab is headed this is just a handful of table lookups (no file I/O), and it
+-- picks up tabs newly enabled mid-session on the next frame automatically.
+local function ensure_log_files()
+    if not cfg.enable_logging or not log_session_active or log_session_char == '' then return end
+    for _, ch in ipairs(LOGGABLE_ORDER) do
+        if cfg.log_channels[ch] and not log_headed[ch] then
+            write_log_header(ch)
+        end
+    end
 end
 
 local function flush_logs()
     for channel, lines in pairs(log_buffers) do
         if #lines > 0 and log_session_char ~= '' then
-            if not log_dir_made then
-                pcall(function() os.execute(string.format('mkdir "%s" 2>nul', log_session_dir())) end)
-                log_dir_made = true
-            end
+            write_log_header(channel)   -- divider first if a line beat ensure_log_files to it
             local f = io.open(log_file_path(channel), 'a')
             if f then
                 for _, ln in ipairs(lines) do f:write(ln, '\n') end
@@ -848,6 +887,20 @@ local function flush_logs()
             log_buffers[channel] = {}
         end
     end
+end
+
+-- Queue a captured line for its tab's log (cheap: format + append to an in-memory buffer). The
+-- actual file write happens later in flush_logs. Assigns to the forward-declared local above so
+-- append_message (defined earlier) can call it.
+function queue_log(channel, epoch, username, message)
+    if not cfg.enable_logging or not log_session_active then return end
+    if not LOG_CHANNEL_NAME[channel] then return end
+    if not cfg.log_channels[channel] then return end       -- tab excluded from logging
+    local buf = log_buffers[channel]
+    if not buf then buf = {}; log_buffers[channel] = buf end
+    -- Collapse any embedded newlines (FFXI's 0x07 -> \n) so each entry stays one log line.
+    local oneline = message:gsub('[\r\n]+', ' ')
+    buf[#buf + 1] = string.format('[%s] %s: %s', os.date('%H:%M:%S', epoch), username, oneline)
 end
 
 -- Starts a session on login (once the character name is known) and ends+flushes it on logout.
@@ -861,8 +914,9 @@ local function manage_log_session(logged_in)
                 log_session_active = true
                 log_session_char = nm
                 log_session_date = os.date('%Y-%m-%d')
-                log_session_stamp = os.date('%H%M%S')
+                log_session_time = os.date('%H:%M:%S')
                 log_dir_made = false
+                log_headed = {}    -- new session -> write a fresh divider into each tab's file
             end
         end
     elseif log_session_active then
@@ -2672,19 +2726,130 @@ local function draw_split_toggle_button()
     end
 end
 
-local sectionHeaderColor = {1.0, 0.82, 0.35, 1.0}
+-- ===== Settings window (XIUI-style: left-sidebar sections + top sub-tabs) =====
+-- Layout modelled on the XIUI config menu: a left column of section buttons, and, within a
+-- section, a row of sub-tabs across the top. The accent (selection tint, sidebar bar, tab
+-- underline) uses MultiChat's own blue title-bar color rather than XIUI's gold so the window
+-- still reads as MultiChat's.
+--
+-- Everything lives on this one table (rather than ~15 separate top-level `local function`s)
+-- to stay under Lua 5.1's 200-locals-per-function cap on the main chunk -- this file was already
+-- near it. Members reference each other through the `sv` upvalue.
+local sv = {}
+sv.SIDEBAR_W = 132
+sv.ACCENT = TITLEBAR_ACTIVE
+sv.categories = { 'General', 'Colors', 'Channels', 'History & Logging', 'Help' }
 
--- One row (or one row per channel) of color pickers for a configurable color category.
--- `path_col_x` is the shared column position computed in draw_settings_window so every
--- section's channel rows line up with each other.
-local function draw_color_setting(label, key, path_col_x)
+-- Compact color-swatch flags: opens the full picker on click, no inline RGBA fields, with an
+-- alpha bar -- matching XIUI's controls. Guarded with `or 0` in case a given Ashita build
+-- doesn't expose them (falls back to the default full editor).
+sv.COLOR_FLAGS = bit.bor(ImGuiColorEditFlags_NoInputs or 0, ImGuiColorEditFlags_AlphaBar or 0)
+
+-- Defensive push helper (returns 1 on success, 0 on failure) so an unbalanced style stack can't
+-- survive a stray error mid-frame -- same discipline as the rest of this file's imgui wrappers.
+function sv.push_color(color_id, color)
+    return (pcall(function() imgui.PushStyleColor(color_id, color) end)) and 1 or 0
+end
+
+function sv.subtab(cat) return settings_ui.subtab[cat] or 1 end
+
+-- One full-width section button in the left sidebar, with a blue accent bar down its left edge
+-- when selected (transparent fill otherwise, faint hover).
+function sv.sidebar_button(label, index)
+    local selected = (settings_ui.category == index)
+    local a = sv.ACCENT
+    local n = 0
+    if selected then
+        n = n + sv.push_color(ImGuiCol_Button,        {a[1], a[2], a[3], 0.28})
+        n = n + sv.push_color(ImGuiCol_ButtonHovered, {a[1], a[2], a[3], 0.28})
+        n = n + sv.push_color(ImGuiCol_ButtonActive,  {a[1], a[2], a[3], 0.28})
+    else
+        n = n + sv.push_color(ImGuiCol_Button,        {0, 0, 0, 0})
+        n = n + sv.push_color(ImGuiCol_ButtonHovered, {1, 1, 1, 0.10})
+        n = n + sv.push_color(ImGuiCol_ButtonActive,  {1, 1, 1, 0.16})
+    end
+    -- GetCursorScreenPos returns a single ImVec2 in this binding (see get_x/get_y usage
+    -- elsewhere) -- unpack it that way, never as two return values.
+    local okPos, pos = pcall(imgui.GetCursorScreenPos)
+    if imgui.Button(label .. '##sidebar' .. index, { sv.SIDEBAR_W - 14, 30 }) then
+        settings_ui.category = index
+    end
+    if selected and okPos and pos then
+        local dl = imgui.GetWindowDrawList()
+        if dl then
+            local px, py = get_x(pos), get_y(pos)
+            dl:AddRectFilled({px, py + 4}, {px + 3, py + 26}, imgui.GetColorU32(a))
+        end
+    end
+    if n > 0 then pcall(function() imgui.PopStyleColor(n) end) end
+end
+
+-- One sub-tab button across the top of a section, with a blue underline when selected.
+function sv.top_tab(cat, index, label)
+    local selected = (sv.subtab(cat) == index)
+    local a = sv.ACCENT
+    local n = 0
+    if selected then
+        n = n + sv.push_color(ImGuiCol_Button,        {a[1], a[2], a[3], 0.22})
+        n = n + sv.push_color(ImGuiCol_ButtonHovered, {a[1], a[2], a[3], 0.22})
+        n = n + sv.push_color(ImGuiCol_ButtonActive,  {a[1], a[2], a[3], 0.22})
+    else
+        n = n + sv.push_color(ImGuiCol_Button,        {0, 0, 0, 0})
+        n = n + sv.push_color(ImGuiCol_ButtonHovered, {1, 1, 1, 0.10})
+        n = n + sv.push_color(ImGuiCol_ButtonActive,  {1, 1, 1, 0.16})
+    end
+    local w = text_width(label) + 24
+    local h = 26
+    local okPos, pos = pcall(imgui.GetCursorScreenPos)
+    if imgui.Button(label .. '##toptab' .. cat .. '_' .. index, { w, h }) then
+        settings_ui.subtab[cat] = index
+    end
+    if selected and okPos and pos then
+        local dl = imgui.GetWindowDrawList()
+        if dl then
+            local px, py = get_x(pos), get_y(pos)
+            dl:AddRectFilled({px + 4, py + h - 2}, {px + w - 4, py + h}, imgui.GetColorU32(a))
+        end
+    end
+    if n > 0 then pcall(function() imgui.PopStyleColor(n) end) end
+end
+
+-- Renders a section's top-tab row from a list of labels, then a divider. The caller reads
+-- sv.subtab(cat) afterwards to decide what to draw below.
+function sv.tab_row(cat, labels)
+    for i, label in ipairs(labels) do
+        if i > 1 then imgui.SameLine() end
+        sv.top_tab(cat, i, label)
+    end
+    imgui.Spacing()
+    imgui.Separator()
+    imgui.Spacing()
+end
+
+-- A collapsible section header (defaults open), matching XIUI's grouping within a page. Colored
+-- to match the addon's own (unfocused) title bar rather than ImGui's default reddish header, so
+-- the section bars read as part of MultiChat's chrome; brightens on hover, uses the active title
+-- bar color while held.
+function sv.section(label)
+    imgui.Spacing()
+    local n = 0
+    n = n + sv.push_color(ImGuiCol_Header,        TITLEBAR_INACTIVE)
+    n = n + sv.push_color(ImGuiCol_HeaderHovered, shade(TITLEBAR_INACTIVE, 1.3))
+    n = n + sv.push_color(ImGuiCol_HeaderActive,  TITLEBAR_ACTIVE)
+    local open = imgui.CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen or 0)
+    if n > 0 then pcall(function() imgui.PopStyleColor(n) end) end
+    return open
+end
+
+-- The color controls for one configurable element (timestamp / username / chat text): a
+-- per-channel toggle + reset, then either a single "all channels" swatch or one swatch per
+-- colorable channel. Swatches use the compact XIUI style (click to open the full picker).
+function sv.color_controls(key)
     local setting = cfg.colors[key]
     imgui.PushID('color_' .. key)
 
-    imgui.AlignTextToFramePadding(); imgui.Text(label)
-    imgui.SameLine(path_col_x)
     local pref = { setting.per_channel or false }
-    if imgui.Checkbox('Per-channel', pref) then setting.per_channel = pref[1] end
+    if imgui.Checkbox('Per-channel colors', pref) then setting.per_channel = pref[1] end
     imgui.SameLine()
     if imgui.Button('Reset') then
         local def = default_config.colors[key]
@@ -2696,134 +2861,163 @@ local function draw_color_setting(label, key, path_col_x)
         end
     end
 
+    imgui.Spacing()
     if not setting.per_channel then
-        imgui.SetNextItemWidth(200)
-        imgui.ColorEdit4('##all', setting.all)
+        imgui.ColorEdit4('All channels##all', setting.all, sv.COLOR_FLAGS)
     else
         for _, ch in ipairs(colorable_channel_order) do
-            imgui.TextColored(channelColors[ch] or {1,1,1,1}, channelLabels[ch] or ch)
-            imgui.SameLine(path_col_x)
-            setting.channels[ch] = setting.channels[ch] or {1,1,1,1}
-            imgui.SetNextItemWidth(200)
-            imgui.ColorEdit4('##' .. ch, setting.channels[ch])
+            setting.channels[ch] = setting.channels[ch] or {1, 1, 1, 1}
+            imgui.ColorEdit4((channelLabels[ch] or ch) .. '##' .. ch, setting.channels[ch], sv.COLOR_FLAGS)
         end
     end
 
     imgui.PopID()
 end
 
--- Settings window: chat transparency + timestamp format + colors + craft/combat filters + split
--- view help + JP font note.
-local function draw_settings_window()
-    if not settings_ui.is_open[1] then return end
-    imgui.SetNextWindowSize({480, 720}, ImGuiCond_FirstUseEver)
-    local pushed_titlebar = push_titlebar_color()
-    if imgui.Begin('MultiChat - Settings', settings_ui.is_open) then
-        -- Shared column position (based on the longest channel label) so every
-        -- section's per-channel rows line up with each other.
-        local max_label_w = 0
-        for _, ch in ipairs(colorable_channel_order) do
-            local w = text_width(channelLabels[ch] or ch)
-            if w > max_label_w then max_label_w = w end
-        end
-        local path_col_x = imgui.GetFrameHeight() + 8 + max_label_w + 12
+-- ---- Per-section content ----
 
-        imgui.TextColored(sectionHeaderColor, 'Appearance')
-        imgui.Separator()
-
+function sv.draw_general()
+    local cat = 1
+    sv.tab_row(cat, { 'Display', 'Timestamps' })
+    if sv.subtab(cat) == 1 then
         imgui.Text('Chat background transparency:')
         local aref = { math.floor(((cfg.chat_bg_alpha or 0.25) * 100) + 0.5) }
+        imgui.SetNextItemWidth(220)
         if imgui.SliderInt('##transparency', aref, 0, 100, '%d%%') then
             cfg.chat_bg_alpha = aref[1] / 100.0
         end
 
         imgui.Text('Font size:')
         local fref = { math.floor(((cfg.font_scale or 1.0) * FONT_BASE_SIZE) + 0.5) }
+        imgui.SetNextItemWidth(220)
         if imgui.SliderInt('##fontscale', fref, math.floor(FONT_BASE_SIZE * 0.5), math.floor(FONT_BASE_SIZE * 2.5), '%dpx') then
             cfg.font_scale = fref[1] / FONT_BASE_SIZE
         end
 
         imgui.Text('Line spacing:')
         local lref = { cfg.line_spacing or 0 }
+        imgui.SetNextItemWidth(220)
         if imgui.SliderInt('##linespacing', lref, 0, 8, '%dpx') then
             cfg.line_spacing = lref[1]
         end
-
-        imgui.Spacing(); imgui.Spacing()
-        imgui.TextColored(sectionHeaderColor, 'Timestamps')
-        imgui.Separator()
-
+    else
+        imgui.Text('Format:')
         if imgui.RadioButton('HH:MM:SS', cfg.timestamp_format == 'hms') then cfg.timestamp_format = 'hms' end
         imgui.SameLine()
         if imgui.RadioButton('HH:MM', cfg.timestamp_format == 'hm') then cfg.timestamp_format = 'hm' end
 
+        imgui.Spacing()
+        imgui.Text('Clock:')
         if imgui.RadioButton('24-hour', not cfg.timestamp_12h) then cfg.timestamp_12h = false end
         imgui.SameLine()
         if imgui.RadioButton('12-hour (AM/PM)', cfg.timestamp_12h) then cfg.timestamp_12h = true end
+    end
+end
 
-        imgui.Spacing(); imgui.Spacing()
-        imgui.TextColored(sectionHeaderColor, 'Colors')
-        imgui.Separator()
+function sv.draw_colors()
+    local cat = 2
+    sv.tab_row(cat, { 'Timestamp', 'Username', 'Chat Text' })
+    imgui.TextWrapped('Craft and Combat use fixed colors by message type (abilities, damage, healing) instead of these settings.')
+    imgui.Spacing()
+    local sub = sv.subtab(cat)
+    if sub == 1 then sv.color_controls('timestamp')
+    elseif sub == 2 then sv.color_controls('username')
+    else sv.color_controls('text') end
+end
 
-        imgui.TextWrapped('Craft and Combat use fixed colors by message type (abilities, damage, healing) instead of these settings.')
-
-        draw_color_setting('Timestamp', 'timestamp', path_col_x)
+function sv.draw_channels()
+    local cat = 3
+    sv.tab_row(cat, { 'Craft', 'Combat', 'Shout / Yell' })
+    local sub = sv.subtab(cat)
+    if sub == 1 then
+        imgui.TextWrapped('Who shows up in the Craft tab. "Myself" includes your own pets/summons.')
         imgui.Spacing()
-        draw_color_setting('Username', 'username', path_col_x)
-        imgui.Spacing()
-        draw_color_setting('Chat Text', 'text', path_col_x)
-
-        imgui.Spacing(); imgui.Spacing()
-        imgui.TextColored(sectionHeaderColor, 'Craft / Combat Filters')
-        imgui.Separator()
-
-        imgui.TextWrapped('Choose who shows up in the Craft and Combat tabs. "Myself" includes your own pets/summons.')
-
-        imgui.Text('Craft:')
         if imgui.RadioButton('Everyone##craft', cfg.craft_filter == 'all') then cfg.craft_filter = 'all' end
         if imgui.RadioButton('Myself##craft', cfg.craft_filter == 'mine') then cfg.craft_filter = 'mine' end
-
+    elseif sub == 2 then
+        imgui.TextWrapped('Who shows up in the Combat tab. "Myself" includes your own pets/summons.')
         imgui.Spacing()
-        imgui.Text('Combat:')
         if imgui.RadioButton('Everyone##combat', cfg.combat_filter == 'all') then cfg.combat_filter = 'all' end
         if imgui.RadioButton('Myself##combat', cfg.combat_filter == 'mine') then cfg.combat_filter = 'mine' end
-
-        imgui.Spacing(); imgui.Spacing()
-        imgui.TextColored(sectionHeaderColor, 'Shout and Yell tab')
-        imgui.Separator()
-
-        imgui.TextWrapped('Choose what shows up in the Shout/Yell tab. Shout and Yell are always shown in different colors so they stay easy to tell apart.')
-
+    else
+        imgui.TextWrapped('What shows up in the Shout/Yell tab. Shout and Yell are always shown in different colors so they stay easy to tell apart.')
+        imgui.Spacing()
         if imgui.RadioButton('Both##shoutyell', cfg.shoutyell_filter == 'both') then cfg.shoutyell_filter = 'both' end
         if imgui.RadioButton('Shout##shoutyell', cfg.shoutyell_filter == 'shout') then cfg.shoutyell_filter = 'shout' end
         if imgui.RadioButton('Yell##shoutyell', cfg.shoutyell_filter == 'yell') then cfg.shoutyell_filter = 'yell' end
+    end
+end
 
-        imgui.Spacing(); imgui.Spacing()
-        imgui.TextColored(sectionHeaderColor, 'History & Logging')
-        imgui.Separator()
+function sv.draw_history()
+    local ph = { cfg.persist_history }
+    if imgui.Checkbox('Remember recent history across reloads/relogs', ph) then cfg.persist_history = ph[1] end
+    imgui.TextWrapped('Keeps your tabs populated after a /multichat reload, a relog, or a restart, instead of starting empty.')
 
-        local ph = { cfg.persist_history }
-        if imgui.Checkbox('Remember recent history across reloads/relogs', ph) then cfg.persist_history = ph[1] end
-        imgui.TextWrapped('Keeps your tabs populated after a /multichat reload, a relog, or a restart, instead of starting empty.')
+    imgui.Spacing(); imgui.Spacing()
+    local el = { cfg.enable_logging }
+    if imgui.Checkbox('Write chat logs to disk', el) then cfg.enable_logging = el[1] end
+    imgui.TextWrapped('Saves each selected tab to config/addons/multichat/logs/<character>/<date>/<Tab>.txt -- one file per tab per day, with each login separated by a divider inside the file. Off by default.')
 
+    if cfg.enable_logging then
         imgui.Spacing()
-        local el = { cfg.enable_logging }
-        if imgui.Checkbox('Write chat logs to disk', el) then cfg.enable_logging = el[1] end
-        imgui.TextWrapped('Saves each tab to its own text file under config/addons/multichat/logs/<character>/<date>/, a new set each time you log in. Off by default.')
+        imgui.Text('Log these tabs:')
+        imgui.Indent(12)
+        -- Two columns so the ten tabs don't run down the whole panel.
+        local any = false
+        for i, ch in ipairs(LOGGABLE_ORDER) do
+            local box = { cfg.log_channels[ch] == true }
+            if cfg.log_channels[ch] then any = true end
+            if imgui.Checkbox((channelLabels[ch] or ch) .. '##log_' .. ch, box) then
+                cfg.log_channels[ch] = box[1]
+            end
+            if (i % 2) == 1 and i < #LOGGABLE_ORDER then imgui.SameLine(150) end
+        end
+        imgui.Unindent(12)
+        if not any then
+            imgui.Spacing()
+            imgui.TextColored({1.0, 0.72, 0.35, 1.0}, 'No tabs selected -- nothing is being logged yet.')
+        end
+    end
+end
 
-        imgui.Spacing(); imgui.Spacing()
-        imgui.TextColored(sectionHeaderColor, 'Split View')
-        imgui.Separator()
-
+function sv.draw_help()
+    if sv.section('Split View') then
         imgui.TextWrapped('Right-click any channel tab (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) and choose "Open in Split View" to show two channels at once.')
         imgui.TextWrapped('Or click the Split button next to Pop Out in the main window to toggle it on/off. Right-click the Split button to choose Side by Side or Stacked layout.')
         imgui.TextWrapped('Drag the divider between the two panes to resize them.')
-
-        imgui.Spacing(); imgui.Spacing()
-        imgui.TextColored(sectionHeaderColor, 'Japanese / CJK Text')
-        imgui.Separator()
-
+    end
+    if sv.section('Japanese / CJK Text') then
         imgui.TextWrapped('If Japanese characters show as "?" here, that is an Ashita-wide font setting, not something this addon controls. See the "How to Add Support for Japanese Language Fonts" section of the README for setup steps.')
+    end
+end
+
+-- Settings window: left sidebar of sections, each with its own top sub-tabs / content.
+function sv.draw_window()
+    if not settings_ui.is_open[1] then return end
+    imgui.SetNextWindowSize({620, 560}, ImGuiCond_FirstUseEver)
+    local pushed_titlebar = push_titlebar_color()
+    if imgui.Begin('MultiChat - Settings', settings_ui.is_open) then
+        -- Left sidebar of section buttons. A faint child background separates it from the
+        -- content area without relying on a hard border line.
+        local pushed_sidebar_bg = sv.push_color(ImGuiCol_ChildBg, {1, 1, 1, 0.03})
+        imgui.BeginChild('mc_settings_sidebar', { sv.SIDEBAR_W, 0 })
+        for i, name in ipairs(sv.categories) do
+            sv.sidebar_button(name, i)
+        end
+        imgui.EndChild()
+        if pushed_sidebar_bg > 0 then pcall(function() imgui.PopStyleColor(pushed_sidebar_bg) end) end
+
+        imgui.SameLine()
+
+        -- Right content area for the selected section.
+        imgui.BeginChild('mc_settings_content', { 0, 0 })
+        local cat = settings_ui.category
+        if cat == 1 then sv.draw_general()
+        elseif cat == 2 then sv.draw_colors()
+        elseif cat == 3 then sv.draw_channels()
+        elseif cat == 4 then sv.draw_history()
+        else sv.draw_help() end
+        imgui.EndChild()
     end
     imgui.End()
     if pushed_titlebar > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar) end) end
@@ -2852,6 +3046,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- which also requires the player entity) so a zone change -- which briefly nils the entity
     -- while you stay logged in -- doesn't split your logs into a new session.
     manage_log_session(logged_in)
+    pcall(ensure_log_files)   -- create empty files for selected tabs up front (shared login stamp)
     if (os.clock() - last_log_flush) >= LOG_FLUSH_INTERVAL then
         last_log_flush = os.clock()
         pcall(flush_logs)
@@ -2896,7 +3091,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
     local pushed_accent = push_accent_colors()
 
-    draw_settings_window()
+    -- Isolated so a fault in the settings window can't abort the frame before the popped/main
+    -- windows below it get drawn (they're rendered later in this same handler).
+    pcall(sv.draw_window)
 
     -- Popped-out windows
     for channel, state in pairs(pop) do

@@ -72,7 +72,9 @@ Once per session after login, MultiChat makes a single HTTPS request to this rep
 Both are controlled from the **History & Logging** section of Settings (⚙), and both write to the addon's **config** folder — `<Ashita install>/config/addons/multichat/` — so they survive reinstalling or deleting the addon folder.
 
 - **Remember history across reloads/relogs** (on by default) — keeps your tabs populated after `/multichat reload`, a relog, or a restart instead of starting empty. Stored per character under `history/`, the most recent ~500 lines per channel.
-- **Write chat logs to disk** (off by default) — saves each tab to its own plain-text file. Files are organized as `logs/<character>/<date>/<Tab>_<HHMMSS>.txt`, with a fresh set each time you log in (the `HHMMSS` is your login time), so multiple sessions in a day stay separate. Zoning does **not** start a new file. Lines are written as `[HH:MM:SS] Name: message`.
+- **Write chat logs to disk** (off by default) — saves each selected tab to **one file per day**: `logs/<character>/<date>/<Tab>.txt`. Logging in again the same day appends to the same files under a `===== login <date> <time> =====` divider, so a day's folder stays tidy (one file per tab) instead of growing with every login. Zoning does **not** start a new session. Lines are written as `[HH:MM:SS] Name: message`.
+  - **Log these tabs** — pick exactly which tabs to log (all on by default). Turn off the ones you don't care about; the rest still log.
+  - Each selected tab's file gets its divider written **as soon as you log in**, so the file exists for the session even if that tab never receives a line.
 
 ## Japanese text shows as `?`
 
