@@ -2697,6 +2697,7 @@ local function draw_channel_messages(channel)
     local startY = 0
     do local ok, p = pcall(imgui.GetCursorPos); if ok and p then startY = get_y(p) end end
     local scrollY = 0; pcall(function() scrollY = imgui.GetScrollY() end)
+    local scrollMaxY = 0; pcall(function() scrollMaxY = imgui.GetScrollMaxY() end)
     local winH = 0; pcall(function() winH = imgui.GetWindowHeight() end)
     if winH <= 0 then winH = 400 end
     local lineH = 0; pcall(function() lineH = imgui.GetTextLineHeightWithSpacing() end)
@@ -2704,6 +2705,12 @@ local function draw_channel_messages(channel)
     local margin = lineH * 4
     local viewTop = scrollY - margin
     local viewBot = scrollY + winH + margin
+    -- "Stuck to bottom" = at/near the newest line (the common case for a live tab). When stuck we
+    -- anchor the visible slice to the newest rows directly (see Pass 1) rather than deriving it
+    -- from scrollY -- the auto-scroll is simultaneously driving scrollY, and deriving the slice
+    -- from it formed a feedback loop that flickered the view a line or two every frame as off-
+    -- screen row heights got measured. scrollMaxY reflects last frame's content, fine for this.
+    local stuck = (scrollMaxY <= 0) or (scrollY >= scrollMaxY - margin)
 
     -- Column start: widest username across the whole working set (cached width per entry), so the
     -- message column doesn't jump as differently-sized names scroll into view.
@@ -2727,20 +2734,39 @@ local function draw_channel_messages(channel)
         if entry._row_h and entry._row_h_w == availx and entry._row_h > 0 then return entry._row_h end
         return lineH
     end
-    local y = startY
     local topSpacer, botSpacer = 0, 0
     local firstVis, lastVis
-    for i = 1, n do
-        local h = row_h(rows[i])
-        if (y + h) < viewTop then
-            topSpacer = topSpacer + h
-        elseif y > viewBot then
-            botSpacer = botSpacer + h
-        else
-            if not firstVis then firstVis = i end
-            lastVis = i
+    if stuck and n > 0 then
+        -- Anchor to the newest rows: walk backward taking rows until they fill the viewport (plus
+        -- margin), then reserve everything above as one spacer. The slice is chosen from the end of
+        -- the list, NOT from scrollY, so the auto-scroll re-pinning can't change which rows are
+        -- drawn -- that's what kills the flicker. topSpacer may be a rough (estimate-based) number
+        -- for never-seen older rows, but since we're pinned to the bottom that only affects the
+        -- scrollbar thumb, never the visible content.
+        local need = winH + margin
+        local acc = 0
+        firstVis = n
+        for i = n, 1, -1 do
+            firstVis = i
+            acc = acc + row_h(rows[i])
+            if acc >= need then break end
         end
-        y = y + h
+        lastVis = n
+        for i = 1, firstVis - 1 do topSpacer = topSpacer + row_h(rows[i]) end
+    else
+        local y = startY
+        for i = 1, n do
+            local h = row_h(rows[i])
+            if (y + h) < viewTop then
+                topSpacer = topSpacer + h
+            elseif y > viewBot then
+                botSpacer = botSpacer + h
+            else
+                if not firstVis then firstVis = i end
+                lastVis = i
+            end
+            y = y + h
+        end
     end
 
     -- Pass 2: reserve the space above with a Dummy, draw only the visible slice (measuring each
@@ -3340,7 +3366,10 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 if imgui.BeginChild(title .. 'Messages', {0, -imgui.GetFrameHeightWithSpacing() + 20}) then
                     apply_font_scale()
                     local atBottom=false; local okY,y = pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                    if okY and okM then atBottom = (y >= my - 1.0) end
+                    -- See the split panes below: a few line-heights of tolerance (not 1px) so the
+                    -- virtualized content-height wobble doesn't flip "at bottom?" every frame.
+                    local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
+                    if okY and okM then atBottom = (y >= my - sbtol) end
                     draw_channel_messages(channel)
                     -- A few pixels of trailing space so descenders (y, g, p, q) on the last line
                     -- aren't clipped by the child's bottom edge when scrolled all the way down.
@@ -3517,7 +3546,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     do
                         apply_font_scale()
                         local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        if okY and okM then atBottom = (y >= my - 1.0) end
+                        -- Tolerance is a few line-heights, not 1px: the virtualized content
+                        -- height wobbles by a line or two as off-screen rows get measured, and a
+                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
+                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
+                        -- still un-sticking on a real scroll-up.
+                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
+                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
@@ -3558,7 +3593,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
                         -- messages
                         local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        if okY and okM then atBottom = (y >= my - 1.0) end
+                        -- Tolerance is a few line-heights, not 1px: the virtualized content
+                        -- height wobbles by a line or two as off-screen rows get measured, and a
+                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
+                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
+                        -- still un-sticking on a real scroll-up.
+                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
+                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(rch)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
@@ -3582,7 +3623,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     do
                         apply_font_scale()
                         local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        if okY and okM then atBottom = (y >= my - 1.0) end
+                        -- Tolerance is a few line-heights, not 1px: the virtualized content
+                        -- height wobbles by a line or two as off-screen rows get measured, and a
+                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
+                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
+                        -- still un-sticking on a real scroll-up.
+                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
+                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
@@ -3626,7 +3673,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
                         -- messages
                         local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        if okY and okM then atBottom = (y >= my - 1.0) end
+                        -- Tolerance is a few line-heights, not 1px: the virtualized content
+                        -- height wobbles by a line or two as off-screen rows get measured, and a
+                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
+                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
+                        -- still un-sticking on a real scroll-up.
+                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
+                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(rch)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
@@ -3640,7 +3693,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     if (imgui.BeginChild('MessagesWindow', {0, -imgui.GetFrameHeightWithSpacing() + 20})) then
                         apply_font_scale()
                         local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        if okY and okM then atBottom = (y >= my - 1.0) end
+                        -- Tolerance is a few line-heights, not 1px: the virtualized content
+                        -- height wobbles by a line or two as off-screen rows get measured, and a
+                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
+                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
+                        -- still un-sticking on a real scroll-up.
+                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
+                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
