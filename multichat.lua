@@ -580,24 +580,29 @@ end
 local function is_alerting(channel) return pop[channel].alert == true end
 
 -- ====== De-dup cache ======
-local recent_seen = {}  -- key -> last_time
-local recent_order = {} -- ring buffer of keys (for cleanup)
+-- Suppresses a message identical to one seen within the last `dedupe_sec`. Keyed by
+-- channel|username|msg -> last-seen time, pruned by TTL every so often so it stays bounded to
+-- roughly one dedupe window's worth of distinct messages. (An earlier ordered-list cleanup
+-- orphaned entries: a key trimmed from the order list while still younger than the cutoff was
+-- never removed from the map, so under a high message rate -- a busy town over a long session --
+-- the map grew without bound and steadily degraded frame time until an addon reload. This
+-- version can't orphan: a full sweep drops everything past its window.)
+local recent_seen = {}  -- key -> last-seen os.clock()
+local recent_seen_inserts = 0
+local DEDUPE_PRUNE_EVERY = 256
 local function dedupe_key(channel, username, msg) return channel .. '|' .. username .. '|' .. msg end
 local function is_duplicate_and_mark(channel, username, msg)
     local k = dedupe_key(channel, username, msg)
     local now = os.clock()
-    local last = recent_seen[k]
     local win = cfg.dedupe_sec or 1.5
+    local last = recent_seen[k]
     if last and (now - last) < win then return true end
     recent_seen[k] = now
-    table.insert(recent_order, k)
-    if #recent_order > 512 then
-        for i = 1, 256 do
-            local oldk = table.remove(recent_order, 1)
-            if oldk then
-                local t = recent_seen[oldk]
-                if t and (now - t) > (win * 2.0) then recent_seen[oldk] = nil end
-            end
+    recent_seen_inserts = recent_seen_inserts + 1
+    if recent_seen_inserts >= DEDUPE_PRUNE_EVERY then
+        recent_seen_inserts = 0
+        for kk, t in pairs(recent_seen) do
+            if (now - t) >= win then recent_seen[kk] = nil end
         end
     end
     return false
