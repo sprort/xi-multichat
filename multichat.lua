@@ -748,7 +748,7 @@ end
 -- (this file sits near Lua's 200-locals-per-chunk cap). Not persisted -- on reload the restored
 -- history is one block and a single fresh break is dropped at its end; relog breaks show for the
 -- session but are replaced by that single break the next time history is restored.
-local sbreak = { color = {0.85, 0.25, 0.25, 1.0}, prev_logged_in = false }
+local sbreak = { color = {0.85, 0.25, 0.25, 1.0}, saw_logout = false }
 
 -- Append a break to every channel that has messages (skips empty tabs so there's never a leading
 -- rule), unless that channel already ends in a break (avoids a double rule when you relog without
@@ -3111,15 +3111,18 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- while you stay logged in -- doesn't split your logs into a new session.
     manage_log_session(logged_in)
 
-    -- A logout->login edge while the addon stays loaded (a relog) drops a session divider into the
-    -- tabs, the same way a fresh addon load does after restoring history. Tracked on login status
-    -- alone (before the draw gate) so the logout is actually observed. The very first login after
-    -- load is left to restore_history below (history_restored is still false here), so the two
-    -- don't double up.
-    if logged_in and not sbreak.prev_logged_in and history_restored then
+    -- A relog (logout to character select, then back in) drops a session divider into the tabs,
+    -- the same way a fresh addon load does after restoring history. Keyed on the character actually
+    -- reaching the logged-OUT state (GetLoginStatus() == 0, i.e. character select / POL), NOT on
+    -- any dip out of "in game" -- a zone change briefly reports "loading" (1) or makes the read
+    -- fail, and treating those as a logout produced a spurious divider on every warp/teleport.
+    -- The very first login after load is left to restore_history below (it resets saw_logout), so
+    -- a logged-out state seen before that first login doesn't count as a relog.
+    if okStatus and loginStatus == 0 then sbreak.saw_logout = true end
+    if logged_in and sbreak.saw_logout and history_restored then
         sbreak.push()
+        sbreak.saw_logout = false
     end
-    sbreak.prev_logged_in = logged_in
 
     pcall(ensure_log_files)   -- create empty files for selected tabs up front (shared login stamp)
     if (os.clock() - last_log_flush) >= LOG_FLUSH_INTERVAL then
@@ -3148,6 +3151,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     if not history_restored then
         history_restored = true
         pcall(restore_history)
+        -- restore_history already dropped this load's divider; clear any logged-out state seen
+        -- before the first login (e.g. sitting at character select) so it isn't read as a relog.
+        sbreak.saw_logout = false
         last_history_save = os.clock()
     elseif (os.clock() - last_history_save) >= HISTORY_SAVE_INTERVAL then
         last_history_save = os.clock()
