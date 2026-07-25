@@ -199,6 +199,7 @@ local default_config = {
     craft_filter     = 'all', -- 'all' | 'mine' -- who to show in the Craft channel
     combat_filter    = 'all', -- 'all' | 'mine' -- who to show in the Combat channel
     persist_history  = true,  -- snapshot recent history to a per-character file, restore on load
+    enable_logging   = false, -- append every captured line to per-tab, per-session text logs on disk
     -- Per-channel popped-out state. Window positions/sizes were already persisted (in `windows`
     -- above), which is why re-popping a window restores where it was -- but whether a channel
     -- was popped out at all wasn't, so a reload dropped every pop-out back into the main window.
@@ -250,6 +251,7 @@ local function apply_cfg_defaults(c)
     c.shoutyell_filter  = c.shoutyell_filter or 'both'
     if c.shoutyell_filter ~= 'shout' and c.shoutyell_filter ~= 'yell' then c.shoutyell_filter = 'both' end
     if c.persist_history == nil then c.persist_history = true end
+    if c.enable_logging == nil then c.enable_logging = false end
 
     -- Normalize the saved popped-out flags to real booleans, with an entry for every channel
     -- (an older save predating this field, or a hand-edited one, may be missing or malformed).
@@ -610,6 +612,10 @@ local function is_duplicate_and_mark(channel, username, msg)
     return false
 end
 
+-- Forward declaration -- the logging module (which owns queue_log's dependencies) is defined
+-- further down, but append_message below needs to call it. Assigned there.
+local queue_log
+
 -- Append new message (with de-dup), possibly mark alert. `text_color`, if given, overrides the
 -- row's text color (used by Craft/Combat's message-type coloring -- see SYSTEM_MESSAGE_PATTERNS).
 -- `uname_color`, if given, overrides the row's username color (used by Combat's enemy/player
@@ -653,7 +659,9 @@ local function append_message(channel, username, msg, is_incoming, text_color, u
         end
     end
 
-    bucket:push({ epoch = os.time(), username = username, message = msg, text_color = text_color, uname_color = uname_color, spans = spans, kind = kind, mention = mention })
+    local epoch = os.time()
+    bucket:push({ epoch = epoch, username = username, message = msg, text_color = text_color, uname_color = uname_color, spans = spans, kind = kind, mention = mention })
+    if queue_log then queue_log(channel, epoch, username, msg) end
     if not no_alert then
         mark_alert_if_needed(channel, mention)
     end
@@ -699,11 +707,15 @@ local function serialize_value(v)
     return 'nil'
 end
 
-local function history_dir()
+-- Persistent data (history snapshot + logs) lives under Ashita's config tree, NOT the addon
+-- folder, so it survives reinstalling or otherwise clearing out the addon folder, and the
+-- auto-updater (which only overwrites code files) never touches it.
+local function config_base_dir()
     local base = AshitaCore:GetInstallPath()
     local sep = (base:sub(-1) == '\\' or base:sub(-1) == '/') and '' or '\\'
-    return base .. sep .. 'config\\addons\\multichat\\history'
+    return base .. sep .. 'config\\addons\\multichat'
 end
+local function history_dir() return config_base_dir() .. '\\history' end
 -- FFXI names are alphanumeric; strip anything else defensively so the filename is always safe.
 local function history_path(pname)
     return history_dir() .. '\\' .. (pname:gsub('[^%w]', '')) .. '.lua'
@@ -778,6 +790,87 @@ local function restore_history()
     end
 end
 
+-- ===== Per-tab plain-text logging =====
+-- Appends every captured line to a text file per tab, under
+-- config/addons/multichat/logs/<Character>/<YYYY-MM-DD>/<Tab>_<HHMMSS>.txt, where HHMMSS is the
+-- session's login time so multiple logins the same day each get their own set. Off by default
+-- (see cfg.enable_logging). Lines are buffered in memory and flushed on a timer + logout +
+-- unload -- never a file write per message.
+local LOG_FLUSH_INTERVAL = 5 -- seconds between buffer flushes
+
+-- Readable, filename-safe tab names (channelLabels has "Sh/Y" and "LS1"/"LS2" abbreviations;
+-- these are clearer for someone browsing the folder and contain no path-hostile characters).
+local LOG_CHANNEL_NAME = {
+    linkshell = 'LS1', linkshell2 = 'LS2', party = 'Party', tell = 'Tell', say = 'Say',
+    shout = 'ShoutYell', craft = 'Craft', combat = 'Combat', quest = 'NPC', sys = 'SYS',
+}
+
+local log_buffers = {}          -- channel -> array of pending formatted lines
+local log_session_active = false
+local log_session_char = ''
+local log_session_date = ''     -- YYYY-MM-DD at login
+local log_session_stamp = ''    -- HHMMSS at login
+local log_dir_made = false      -- mkdir the session folder once, not on every flush
+
+local function log_session_dir()
+    return string.format('%s\\logs\\%s\\%s', config_base_dir(),
+        (log_session_char:gsub('[^%w]', '')), log_session_date)
+end
+local function log_file_path(channel)
+    return string.format('%s\\%s_%s.txt', log_session_dir(), (LOG_CHANNEL_NAME[channel] or channel), log_session_stamp)
+end
+
+-- Queue a captured line for its tab's log (cheap: format + append to an in-memory buffer). The
+-- actual file write happens later in flush_logs. Assigns to the forward-declared local above so
+-- append_message (defined earlier) can call it.
+function queue_log(channel, epoch, username, message)
+    if not cfg.enable_logging or not log_session_active then return end
+    if not LOG_CHANNEL_NAME[channel] then return end
+    local buf = log_buffers[channel]
+    if not buf then buf = {}; log_buffers[channel] = buf end
+    -- Collapse any embedded newlines (FFXI's 0x07 -> \n) so each entry stays one log line.
+    local oneline = message:gsub('[\r\n]+', ' ')
+    buf[#buf + 1] = string.format('[%s] %s: %s', os.date('%H:%M:%S', epoch), username, oneline)
+end
+
+local function flush_logs()
+    for channel, lines in pairs(log_buffers) do
+        if #lines > 0 and log_session_char ~= '' then
+            if not log_dir_made then
+                pcall(function() os.execute(string.format('mkdir "%s" 2>nul', log_session_dir())) end)
+                log_dir_made = true
+            end
+            local f = io.open(log_file_path(channel), 'a')
+            if f then
+                for _, ln in ipairs(lines) do f:write(ln, '\n') end
+                f:close()
+            end
+            log_buffers[channel] = {}
+        end
+    end
+end
+
+-- Starts a session on login (once the character name is known) and ends+flushes it on logout.
+-- Driven by login status alone, so a zone change (which briefly nils the player entity but keeps
+-- you logged in) doesn't split the log into a new session. Called every frame from d3d_present.
+local function manage_log_session(logged_in)
+    if logged_in then
+        if not log_session_active then
+            local nm = current_char_name()
+            if nm ~= '' then
+                log_session_active = true
+                log_session_char = nm
+                log_session_date = os.date('%Y-%m-%d')
+                log_session_stamp = os.date('%H%M%S')
+                log_dir_made = false
+            end
+        end
+    elseif log_session_active then
+        log_session_active = false
+        pcall(flush_logs)
+    end
+end
+
 -- ===== In-game update checking =====
 -- Reports into SYS (username "MultiChat") rather than a plain /echo, so it's visible in the
 -- same history as everything else. Only an actual available update triggers SYS's normal
@@ -820,6 +913,7 @@ local update_available_version = nil
 local update_check_done = false
 local history_restored = false
 local last_history_save = 0
+local last_log_flush = 0
 
 local function check_for_update()
     local remote = fetch_remote_version()
@@ -929,13 +1023,14 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
         return
     end
 
-    -- Mirror outgoing /say (/s ...)
+    -- Mirror outgoing /say (/s ...). These are your OWN messages, so they never raise a tab alert
+    -- (no_alert=true) -- you don't need to be flagged about text you just typed.
     local say_msg = lower:match('^/s%s+(.+)$') or lower:match('^/say%s+(.+)$')
     if say_msg then
         local me = current_char_name()
         local orig = cmdline:gsub('^/%a+%s+', '', 1)
         orig = clean_str(orig)
-        append_message('say', me ~= '' and me or 'Me', orig, false)
+        append_message('say', me ~= '' and me or 'Me', orig, false, nil, nil, nil, true)
         return
     end
 
@@ -948,14 +1043,14 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
     if shout_msg then
         local me = current_char_name()
         local orig = clean_str(cmdline:gsub('^/%a+%s+', '', 1))
-        append_message('shout', me ~= '' and me or 'Me', orig, false, SHOUT_TEXT_COLOR, nil, nil, false, 'shout')
+        append_message('shout', me ~= '' and me or 'Me', orig, false, SHOUT_TEXT_COLOR, nil, nil, true, 'shout')
         return
     end
     local yell_msg = lower:match('^/yell%s+(.+)$') or lower:match('^/y%s+(.+)$')
     if yell_msg then
         local me = current_char_name()
         local orig = clean_str(cmdline:gsub('^/%a+%s+', '', 1))
-        append_message('shout', me ~= '' and me or 'Me', orig, false, YELL_TEXT_COLOR, nil, nil, false, 'yell')
+        append_message('shout', me ~= '' and me or 'Me', orig, false, YELL_TEXT_COLOR, nil, nil, true, 'yell')
         return
     end
 
@@ -2704,6 +2799,19 @@ local function draw_settings_window()
         if imgui.RadioButton('Yell##shoutyell', cfg.shoutyell_filter == 'yell') then cfg.shoutyell_filter = 'yell' end
 
         imgui.Spacing(); imgui.Spacing()
+        imgui.TextColored(sectionHeaderColor, 'History & Logging')
+        imgui.Separator()
+
+        local ph = { cfg.persist_history }
+        if imgui.Checkbox('Remember recent history across reloads/relogs', ph) then cfg.persist_history = ph[1] end
+        imgui.TextWrapped('Keeps your tabs populated after a /multichat reload, a relog, or a restart, instead of starting empty.')
+
+        imgui.Spacing()
+        local el = { cfg.enable_logging }
+        if imgui.Checkbox('Write chat logs to disk', el) then cfg.enable_logging = el[1] end
+        imgui.TextWrapped('Saves each tab to its own text file under config/addons/multichat/logs/<character>/<date>/, a new set each time you log in. Off by default.')
+
+        imgui.Spacing(); imgui.Spacing()
         imgui.TextColored(sectionHeaderColor, 'Split View')
         imgui.Separator()
 
@@ -2724,6 +2832,7 @@ end
 -- Persist on unload
 ashita.events.register('unload', 'unload_cb', function ()
     pcall(save_history)
+    pcall(flush_logs)
     if have_settings and type(settings.save) == 'function' then
         pcall(settings.save)
     end
@@ -2737,7 +2846,21 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- library (addons/libs/settings.lua) hits this same problem and solves it by also checking
     -- GetLoginStatus() == 2, so we use the same combined check here.
     local okStatus, loginStatus = pcall(function() return AshitaCore:GetMemoryManager():GetPlayer():GetLoginStatus() end)
-    if (not okStatus) or loginStatus ~= 2 or GetPlayerEntity() == nil then return end
+    local logged_in = okStatus and loginStatus == 2
+
+    -- Log session start/end + periodic flush run on login status ALONE (not the draw gate below,
+    -- which also requires the player entity) so a zone change -- which briefly nils the entity
+    -- while you stay logged in -- doesn't split your logs into a new session.
+    manage_log_session(logged_in)
+    if (os.clock() - last_log_flush) >= LOG_FLUSH_INTERVAL then
+        last_log_flush = os.clock()
+        pcall(flush_logs)
+    end
+
+    -- Draw gate: also require the player entity so nothing draws over the character-select
+    -- preview or a zone/loading screen (GetPlayerEntity goes non-nil on char select before
+    -- you've actually logged in, so GetLoginStatus() == 2 is the real "in the world" signal).
+    if not logged_in or GetPlayerEntity() == nil then return end
 
     -- One-time auto-check, the first frame this handler runs past the login gate above (i.e.
     -- once, right after the character is confirmed loaded into the world -- same trigger this

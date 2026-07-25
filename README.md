@@ -30,6 +30,7 @@ Built and tested on HorizonXI; should work on any Ashita v4 server.
 - Split view (side-by-side or stacked) and multi-window pop-out — pop-outs restore their position after a reload
 - Flashing alert for unseen messages (visual only, no sound); click a line to copy it
 - 5000 lines per channel, duplicate suppression, settings persist across sessions
+- Optional history restore across reloads/relogs, and optional per-tab plain-text logs (see below)
 - Stays hidden until you're logged in — safe to auto-load from `default.txt`
 
 **Settings** (⚙): transparency, font size, line spacing, timestamp format, and per-channel or global colors.
@@ -65,6 +66,13 @@ Craft/Combat's phrase list isn't exhaustive; uncommon messages may not be catego
 ## Updating
 
 Once per session after login, MultiChat makes a single HTTPS request to this repo to compare versions — the only time it reaches outside your client. It only posts the result to SYS; nothing downloads unless you run `/multichat update`, which fetches the files fresh, aborts on any failed download rather than leaving a partial mix, then reloads.
+
+## History and logging
+
+Both are controlled from the **History & Logging** section of Settings (⚙), and both write to the addon's **config** folder — `<Ashita install>/config/addons/multichat/` — so they survive reinstalling or deleting the addon folder.
+
+- **Remember history across reloads/relogs** (on by default) — keeps your tabs populated after `/multichat reload`, a relog, or a restart instead of starting empty. Stored per character under `history/`, the most recent ~500 lines per channel.
+- **Write chat logs to disk** (off by default) — saves each tab to its own plain-text file. Files are organized as `logs/<character>/<date>/<Tab>_<HHMMSS>.txt`, with a fresh set each time you log in (the `HHMMSS` is your login time), so multiple sessions in a day stay separate. Zoning does **not** start a new file. Lines are written as `[HH:MM:SS] Name: message`.
 
 ## Japanese text shows as `?`
 
