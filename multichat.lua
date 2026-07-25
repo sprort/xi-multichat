@@ -85,6 +85,16 @@ function RingBuffer:each(fn)
     end
 end
 
+-- Iterates only the entries from logical index `fromLogical` (0-based, same indexing as :each)
+-- through the newest. Lets the renderer touch just the tail it actually draws instead of walking
+-- the whole (up to 5000-row) buffer every frame -- see draw_channel_messages' fast path.
+function RingBuffer:each_range(fromLogical, fn)
+    if fromLogical < 0 then fromLogical = 0 end
+    for i = fromLogical, self.count - 1 do
+        fn(self.slots[(self.head + i - 1) % self.capacity + 1])
+    end
+end
+
 -- Most recently pushed entry, or nil if the buffer is empty.
 function RingBuffer:last()
     if self.count == 0 then return nil end
@@ -962,25 +972,29 @@ function queue_log(channel, epoch, username, message)
     buf[#buf + 1] = string.format('[%s] %s: %s', os.date('%H:%M:%S', epoch), username, oneline)
 end
 
--- Starts a session on login (once the character name is known) and ends+flushes it on logout.
--- Driven by login status alone, so a zone change (which briefly nils the player entity but keeps
--- you logged in) doesn't split the log into a new session. Called every frame from d3d_present.
-local function manage_log_session(logged_in)
-    if logged_in then
-        if not log_session_active then
-            local nm = current_char_name()
-            if nm ~= '' then
-                log_session_active = true
-                log_session_char = nm
-                log_session_date = os.date('%Y-%m-%d')
-                log_session_time = os.date('%H:%M:%S')
-                log_dir_made = false
-                log_headed = {}    -- new session -> write a fresh divider into each tab's file
-            end
+-- Starts a logging session (and its "===== login =====" divider) on login, and ends+flushes it
+-- only on a genuine logout. `real_logout` is true only when the character has actually reached the
+-- logged-OUT state (GetLoginStatus() == 0, character select / POL) -- NOT on a zone change, which
+-- briefly reports "loading" (1) or makes the read fail. Ending on any dip out of "in game" was
+-- writing a spurious login divider on every warp/teleport. Called every frame from d3d_present.
+local function manage_log_session(logged_in, real_logout)
+    if real_logout then
+        if log_session_active then
+            log_session_active = false
+            pcall(flush_logs)
         end
-    elseif log_session_active then
-        log_session_active = false
-        pcall(flush_logs)
+        return
+    end
+    if logged_in and not log_session_active then
+        local nm = current_char_name()
+        if nm ~= '' then
+            log_session_active = true
+            log_session_char = nm
+            log_session_date = os.date('%Y-%m-%d')
+            log_session_time = os.date('%H:%M:%S')
+            log_dir_made = false
+            log_headed = {}    -- new session -> write a fresh divider into each tab's file
+        end
     end
 end
 
@@ -1292,10 +1306,13 @@ local ABILITY_COLOR    = {255/255, 230/255,  60/255, 1.0} -- yellow: skills/abil
 local DAMAGE_COLOR     = {255/255,  90/255,  90/255, 1.0} -- red: damage dealt/taken
 local HEAL_COLOR       = {120/255, 200/255, 255/255, 1.0} -- light blue: curing/recovery
 local ITEM_COLOR       = {1,       1,       1,       1.0} -- white: item drops/who received them
-local EXP_COLOR        = {110/255, 220/255, 110/255, 1.0} -- green: experience points gained
-local LEVEL_UP_COLOR   = EXP_COLOR                        -- green: level up
+local EXP_COLOR        = {110/255, 220/255, 110/255, 1.0} -- green: experience points gained (also level up)
 local LEVEL_DOWN_COLOR = {255/255, 150/255, 150/255, 1.0} -- light red: level down
 local STATUS_COLOR     = {195/255, 130/255, 255/255, 1.0} -- purple: status effects landing (ailments and buffs)
+-- Combat rows show the body in this neutral gray and tint only the meaningful tokens (numbers, and
+-- the spell/ability/effect name) in the line's type color -- see system_row_style. Coloring the
+-- whole line made stacks of same-type lines (a page of casts, a flurry of hits) blur together.
+local COMBAT_NEUTRAL_COLOR = {0.82, 0.82, 0.85, 1.0}
 
 -- Default text color for the SYS tab (general system messages/broadcasts) -- an easy-to-read
 -- light purple, matching the shade FFXI's own system text traditionally uses.
@@ -1305,7 +1322,7 @@ local SYSTEM_TEXT_COLOR = {180/255, 150/255, 255/255, 1.0}
 -- always-alert behavior -- confirmed via in-game screenshot (the "Merchandise placed on
 -- auction." confirmation sequence). Not an exhaustive list of every AH message yet (e.g.
 -- successful sale/bid notifications aren't covered), just what's been seen so far.
-local AH_TEXT_COLOR = ABILITY_COLOR -- yellow
+-- Auction House / delivery messages reuse ABILITY_COLOR (yellow) for their SYS-tab text.
 local AH_MESSAGES_EXACT = {
     ['Merchandise placed on auction.'] = true,
     ["If merchandise remains unsold after 30 weeks (Vana'diel time), it will be returned to your current residence."] = true,
@@ -1507,10 +1524,10 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- username instead of stopping at "Harcyn". Checking "uses"/"casts"/"starts casting" first
     -- means the actor capture stops at the ability verb regardless of what follows "but".
     { channel = 'combat', pattern = "^(.-)'s casting is interrupted%.$",                color = ABILITY_COLOR },
-    { channel = 'combat', pattern = "^(.-) readies .-%.$",                              color = ABILITY_COLOR },
-    { channel = 'combat', pattern = "^(.-) starts casting .- on .-%.$",                 color = ABILITY_COLOR },
-    { channel = 'combat', pattern = "^(.-) starts casting .-%.$",                       color = ABILITY_COLOR },
-    { channel = 'combat', pattern = "^(.-) casts .-%.$",                                color = ABILITY_COLOR },
+    { channel = 'combat', pattern = "^(.-) readies (.-)%.$",           name_capture = 2, color = ABILITY_COLOR },
+    { channel = 'combat', pattern = "^(.-) starts casting (.-) on (.-)%.$", name_capture = 2, target_capture = 3, color = ABILITY_COLOR },
+    { channel = 'combat', pattern = "^(.-) starts casting (.-)%.$",    name_capture = 2, color = ABILITY_COLOR },
+    { channel = 'combat', pattern = "^(.-) casts (.-)%.$",             name_capture = 2, color = ABILITY_COLOR },
     -- Item use ("Sprort uses a Hi-Potion.") vs. ability/TP move use ("The Clipper uses Big
     -- Scissors.") share the identical "X uses Y." shape, with no distinct verb to key off of.
     -- The one reliable signal is grammar: consumable item names take an indefinite article
@@ -1518,19 +1535,20 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- nouns and never do -- so this only matches the article form, checked before the plain
     -- "uses" pattern below. NOT verified against a real item-use screenshot yet; flag if wrong.
     { channel = 'combat', pattern = "^(.-) uses an? (.-)%.$",         item_capture = 2, color = ABILITY_COLOR },
-    { channel = 'combat', pattern = "^(.-) uses .-%.$",                                 color = ABILITY_COLOR },
+    { channel = 'combat', pattern = "^(.-) uses (.-)%.$",              name_capture = 2, color = ABILITY_COLOR },
 
-    -- Combat: damage / misses / crits / recovery / defeat
-    { channel = 'combat', pattern = "^(.-) hits .- for %d+ points? of damage%.$",       color = DAMAGE_COLOR },
+    -- Combat: damage / misses / crits / recovery / defeat. target_capture names the OTHER entity
+    -- in the line (the one being hit/missed/defeated) so it can be tinted its own entity color.
+    { channel = 'combat', pattern = "^(.-) hits (.-) for %d+ points? of damage%.$", target_capture = 2, color = DAMAGE_COLOR },
     { channel = 'combat', pattern = "^(.-) takes %d+ points? of damage.*%.$",           color = DAMAGE_COLOR },
-    { channel = 'combat', pattern = "^(.-) misses .-%.$",                                color = ITEM_COLOR },
+    { channel = 'combat', pattern = "^(.-) misses (.-)%.$",            target_capture = 2, color = ITEM_COLOR },
     { channel = 'combat', pattern = "^(.-) scores? a critical hit!?$" },
     { channel = 'combat', pattern = "^(.-) recovers %d+ HP%.$",                         color = HEAL_COLOR },
     { channel = 'combat', pattern = "^(.-) recovers %d+ MP%.$",                         color = HEAL_COLOR },
-    { channel = 'combat', pattern = "^(.-) defeats .-%.$" },
+    { channel = 'combat', pattern = "^(.-) defeats (.-)%.$",           target_capture = 2 },
     -- Passive voice for the losing side -- confirmed via in-game screenshot ("Daphodin was
     -- defeated by the Goblin Healer.").
-    { channel = 'combat', pattern = "^(.-) was defeated by .-%.$" },
+    { channel = 'combat', pattern = "^(.-) was defeated by (.-)%.$",   target_capture = 2 },
     { channel = 'combat', pattern = "^(.-) falls to the ground%.$" },
     { channel = 'combat', pattern = "^(.-) vanishes!?$",                                color = ITEM_COLOR },
 
@@ -1539,9 +1557,9 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- ("is paralyzed.", "is slowed.", etc.) are handled separately in process_system_line
     -- (see STATUS_AILMENT_WORDS) since an unqualified "(.-) is (%a+)%." pattern here would be
     -- too broad and risk matching ordinary chat sentences that happen to fit "X is Y.".
-    { channel = 'combat', pattern = "^(.-) is afflicted with .-%.$",                     color = STATUS_COLOR },
+    { channel = 'combat', pattern = "^(.-) is afflicted with (.-)%.$",  name_capture = 2, color = STATUS_COLOR },
     -- Buffs landing -- confirmed via in-game screenshot ("The Clipper gains the effect of Shell.").
-    { channel = 'combat', pattern = "^(.-) gains the effect of .-%.$",                   color = STATUS_COLOR },
+    { channel = 'combat', pattern = "^(.-) gains the effect of (.-)%.$", name_capture = 2, color = STATUS_COLOR },
 
     -- Combat: item drops -- exact phrasing confirmed via in-game screenshot ("You find a slice
     -- of land crab meat on the Clipper." / "Sprort obtains a slice of land crab meat.").
@@ -1558,7 +1576,7 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- confirmed ("Fetters falls to level 54.") -- real wording is "falls to level N.", not the
     -- originally-guessed "loses a level!". Experience is still NOT verified and may need fixing.
     { channel = 'combat', pattern = "^(.-) gains %d+ experience points?%.$",            color = EXP_COLOR },
-    { channel = 'combat', pattern = "^(.-) attains level %d+!?$",                       color = LEVEL_UP_COLOR },
+    { channel = 'combat', pattern = "^(.-) attains level %d+!?$",                       color = EXP_COLOR },
     { channel = 'combat', pattern = "^(.-) falls to level %d+%.$",                      color = LEVEL_DOWN_COLOR },
 
     -- Craft: synthesis results -- native log shows both in plain white, not the craft tab's
@@ -1914,6 +1932,57 @@ local function find_item_span(body, item_name)
     return { { s = s, e = e, color = ITEM_NAME_COLOR } }
 end
 
+-- Base text color + highlight spans for a system-message row. Combat is special-cased: its body
+-- is shown neutral with only the numbers and the captured spell/ability/effect name tinted in the
+-- line's type color, so a stack of same-type lines stays legible instead of becoming a wall of one
+-- color. (Item drops keep their green item-name span.) Every other channel is unchanged -- its
+-- whole-line color plus any item-name span, exactly as before.
+local function system_row_style(entry, body, matches)
+    if entry.channel ~= 'combat' then
+        return entry.color, (entry.item_capture and find_item_span(body, matches[entry.item_capture]) or nil)
+    end
+    local color = entry.color
+    local spans = {}
+    if entry.item_capture then
+        local it = find_item_span(body, matches[entry.item_capture])
+        if it then for _, sp in ipairs(it) do spans[#spans + 1] = sp end end
+    end
+    -- the target entity (who was hit/missed/defeated/cast-on) in its own entity color -- players,
+    -- party/alliance, enemies, pets/summons -- resolved the same way the actor's name is. Kept
+    -- independent of the line's type color so it applies even to uncolored lines (defeats, etc.).
+    if entry.target_capture then
+        local tgt = matches[entry.target_capture]
+        if tgt and tgt ~= '' then
+            local bare = tgt:gsub('^[Tt]he%s+', '')   -- "the Arid Lizard" -> entity name "Arid Lizard"
+            local s, e = body:find(bare, 1, true)
+            if s then
+                local ok, tc = pcall(resolve_combat_uname_color, bare)
+                if ok and tc then spans[#spans + 1] = { s = s, e = e, color = tc } end
+            end
+        end
+    end
+    if color then
+        -- the captured spell/ability/effect name
+        if entry.name_capture then
+            local nm = matches[entry.name_capture]
+            if nm and nm ~= '' then
+                local s, e = body:find(nm, 1, true)
+                if s then spans[#spans + 1] = { s = s, e = e, color = color } end
+            end
+        end
+        -- every number run (damage / HP / MP / EXP / level amounts)
+        local init = 1
+        while true do
+            local s, e = body:find('%d+', init)
+            if not s then break end
+            spans[#spans + 1] = { s = s, e = e, color = color }
+            init = e + 1
+        end
+    end
+    if #spans == 0 then spans = nil end
+    return COMBAT_NEUTRAL_COLOR, spans
+end
+
 -- Delivery box messages (claiming Auction House sale proceeds from the mog house delivery box,
 -- 8 numbered slots) -- text matched, not mode, same reasoning as Auction House above. Confirmed
 -- via in-game screenshot ("Slot 5:", "The money the buyer paid for the bird egg you put on
@@ -1931,7 +2000,7 @@ local function try_delivery_message(line)
     if not isDelivery then return false end
     -- no_alert = true (routine bookkeeping) and no_dedupe = true (repeated identical payout
     -- lines from claiming a stack of the same item are all real, not double-captures).
-    append_message('sys', 'Delivery', line, true, AH_TEXT_COLOR, nil, find_item_span(line, item), true, nil, true)
+    append_message('sys', 'Delivery', line, true, ABILITY_COLOR, nil, find_item_span(line, item), true, nil, true)
     return true
 end
 
@@ -2076,7 +2145,7 @@ local function process_system_line(msg)
         -- "X's skill rises N points." is an incremental skill-up (ability yellow); "X's skill
         -- reaches level N." is a skill level up, same green as attaining a character level --
         -- confirmed via in-game screenshot ("Daphodin's evasion skill reaches level 253.").
-        local skill_color = body:match('reaches level %d+') and LEVEL_UP_COLOR or ABILITY_COLOR
+        local skill_color = body:match('reaches level %d+') and EXP_COLOR or ABILITY_COLOR
         append_message(ch, skillActor, body, true, skill_color, resolve_uname_color(ch, skillActor))
         return
     end
@@ -2113,12 +2182,9 @@ local function process_system_line(msg)
             if msg:find(entry.pattern) then
                 local me = current_char_name()
                 local who = me ~= '' and me or 'You'
-                local spans
-                if entry.item_capture then
-                    local matches = { msg:match(entry.pattern) }
-                    spans = find_item_span(msg, matches[entry.item_capture])
-                end
-                append_message(entry.channel, who, msg, true, entry.color, resolve_uname_color(entry.channel, who), spans)
+                local matches = { msg:match(entry.pattern) }
+                local base, spans = system_row_style(entry, msg, matches)
+                append_message(entry.channel, who, msg, true, base, resolve_uname_color(entry.channel, who), spans)
                 return
             end
         else
@@ -2139,13 +2205,13 @@ local function process_system_line(msg)
                     actor = rangedOwner
                     body = rangedPhrase .. ' ' .. body
                 end
-                local spans = entry.item_capture and find_item_span(body, matches[entry.item_capture])
+                local base, spans = system_row_style(entry, body, matches)
                 if actor:lower() == 'you' then
                     local me = current_char_name()
                     if me ~= '' then actor = me end
                 end
                 actor = strip_leading_article(actor)
-                append_message(entry.channel, actor, body, true, entry.color, resolve_uname_color(entry.channel, actor), spans)
+                append_message(entry.channel, actor, body, true, base, resolve_uname_color(entry.channel, actor), spans)
                 return
             end
         end
@@ -2285,7 +2351,7 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
                 -- AH message (listing confirmation, fees, purchase confirmations) stays silent.
                 local saleItem = line:match("^Your '(.-)' has sold to .- for %d+ gil!$")
                 local buyItem = line:match("^You buy the (.-) for [%d,]+ gil%.$")
-                append_message('sys', 'Auction', line, true, AH_TEXT_COLOR, nil, find_item_span(line, saleItem or buyItem), not saleItem)
+                append_message('sys', 'Auction', line, true, ABILITY_COLOR, nil, find_item_span(line, saleItem or buyItem), not saleItem)
             elseif try_delivery_message(line) then
                 -- Already fully handled inside try_delivery_message.
             elseif try_checker_message(line) then
@@ -2576,29 +2642,50 @@ local function draw_channel_messages(channel)
         text_color   = resolve_color(cfg.colors.text, channel, {1,1,1,1})
     end
 
-    -- Only the last MAX_RENDERED_ROWS visible rows are drawn (see that constant). Count the
-    -- visible rows first so we know how many older ones to skip -- a cheap O(n) pass of table
-    -- lookups (no ImGui, no os.date), unlike the draw pass it's bounding.
-    local visible_count = 0
-    bucket:each(function (entry)
-        if channel_row_visible(channel, entry) then visible_count = visible_count + 1 end
-    end)
+    -- Only the last MAX_RENDERED_ROWS visible rows are ever drawn. When the tab's filter shows
+    -- everything (the default for every tab), every row is visible, so we can skip straight to the
+    -- tail with each_range instead of walking the whole (up to 5000-row) buffer three times a
+    -- frame -- the walk was the source of the slowdown as a busy tab filled up. Only Craft/Combat
+    -- with a "Myself" filter, or Shout/Yell narrowed to one type, still needs the per-row scan.
+    local permissive = true
+    if channel == 'craft' then permissive = (cfg.craft_filter == 'all')
+    elseif channel == 'combat' then permissive = (cfg.combat_filter == 'all')
+    elseif channel == 'shout' then permissive = (cfg.shoutyell_filter == 'both') end
+
+    local visible_count
+    if permissive then
+        visible_count = bucket.count           -- everything is visible -> O(1)
+    else
+        visible_count = 0
+        bucket:each(function (entry) if channel_row_visible(channel, entry) then visible_count = visible_count + 1 end end)
+    end
     local skip = visible_count - MAX_RENDERED_ROWS
     if skip < 0 then skip = 0 end
 
-    -- Fixed column start for message text: measured from the current timestamp format's width
-    -- plus the widest username among the rows actually being rendered (not a hypothetical
-    -- worst-case, and not the whole stored history -- only what's drawn), so message text lines
-    -- up across all visible rows without reserving space for names that aren't shown.
+    -- Runs `fn` over exactly the rows being rendered (the last MAX_RENDERED_ROWS visible ones). In
+    -- the permissive case the rendered rows are the logical tail [skip .. end], so each_range walks
+    -- only those; otherwise fall back to scanning and counting visible rows past `skip`.
+    local function each_rendered(fn)
+        if permissive then
+            bucket:each_range(skip, fn)
+        else
+            local seen = 0
+            bucket:each(function (entry)
+                if not channel_row_visible(channel, entry) then return end
+                seen = seen + 1
+                if seen > skip then fn(entry) end
+            end)
+        end
+    end
+
+    -- Fixed column start for message text: measured from the current timestamp format's width plus
+    -- the widest username among the rows actually being rendered, so message text lines up across
+    -- all visible rows without reserving space for names that aren't shown.
     local ts_w = text_width(get_timestamp())
     local max_name_w = 0
     -- Username width only needs recomputing when the font scale changes (CalcTextSize depends on
     -- it); a username never changes after a row is created. Cached on the entry.
-    local seen_w = 0
-    bucket:each(function (entry)
-        if not channel_row_visible(channel, entry) then return end
-        seen_w = seen_w + 1
-        if seen_w <= skip then return end
+    each_rendered(function (entry)
         if entry.is_break then return end   -- no username, contributes no column width
         if entry._uname_w_scale ~= cfg.font_scale then
             entry._uname_w = text_width(entry.username .. ':')
@@ -2608,21 +2695,16 @@ local function draw_channel_messages(channel)
     end)
     local msg_col_x = ts_w + 8 + max_name_w + 8
 
-    -- Timestamp-format signature: the formatted timestamp string and the full "ts name: msg"
-    -- copy string are cached per entry and only rebuilt when this changes, rather than calling
-    -- os.date + string.format for every drawn row every frame (a major allocation/GC cost at
-    -- scale). Username and message never change after creation, so the timestamp format is the
-    -- only thing that can invalidate them.
+    -- Timestamp-format signature: the formatted timestamp string and the full "ts name: msg" copy
+    -- string are cached per entry and only rebuilt when this changes, rather than calling os.date +
+    -- string.format for every drawn row every frame. Username and message never change after
+    -- creation, so the timestamp format is the only thing that can invalidate them.
     local ts_sig = (cfg.timestamp_12h and '12' or '24') .. (cfg.timestamp_format or 'hms')
 
     local idx = 0
-    local seen_d = 0
     local pushed_spacing = 0
     if pcall(function() imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, {8, cfg.line_spacing or 4}) end) then pushed_spacing = 1 end
-    bucket:each(function (entry)
-        if not channel_row_visible(channel, entry) then return end
-        seen_d = seen_d + 1
-        if seen_d <= skip then return end
+    each_rendered(function (entry)
         idx = idx + 1
         if entry.is_break then sbreak.draw(entry); return end
         if entry._ts_sig ~= ts_sig then
@@ -2634,12 +2716,9 @@ local function draw_channel_messages(channel)
         -- message (currently just achievement unlocks) renders in the same color everywhere.
         local row_text_color = entry.text_color or text_color
         -- entry.uname_color is honored on every channel, not just Combat, so a broadcast message
-        -- (achievement unlocks, hardcore milestones) keeps its own username color in whichever
-        -- tab it lands in. Only rows that explicitly stored one are affected -- resolve_uname_color
-        -- returns nil for every non-Combat channel, so everything else still falls back to the
-        -- channel default. Combat's enemy/player color is resolved once at message-append time
-        -- (see resolve_combat_uname_color) and stored on the entry, rather than re-scanning the
-        -- entity table here every frame for every visible row.
+        -- (achievement unlocks, hardcore milestones) keeps its own username color in whichever tab
+        -- it lands in. Combat's enemy/player color is resolved once at message-append time (see
+        -- resolve_combat_uname_color) and stored on the entry, not re-scanned here every frame.
         local row_uname_color = entry.uname_color or uname_color
         local tint = entry.mention and MENTION_TINT_COLOR or nil
         draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, idx, msg_col_x, entry.spans, entry, tint)
@@ -3105,20 +3184,20 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- GetLoginStatus() == 2, so we use the same combined check here.
     local okStatus, loginStatus = pcall(function() return AshitaCore:GetMemoryManager():GetPlayer():GetLoginStatus() end)
     local logged_in = okStatus and loginStatus == 2
+    -- A genuine logout reaches character select / POL (status 0). Zoning (warp/teleport/etc.)
+    -- instead reports "loading" (1) or makes the read fail -- never 0 -- so this is the one signal
+    -- that reliably tells a real relog apart from a zone. Both the log-file session divider and the
+    -- in-chat session divider key off it, so neither fires on a zone.
+    local real_logout = okStatus and loginStatus == 0
 
     -- Log session start/end + periodic flush run on login status ALONE (not the draw gate below,
-    -- which also requires the player entity) so a zone change -- which briefly nils the entity
-    -- while you stay logged in -- doesn't split your logs into a new session.
-    manage_log_session(logged_in)
+    -- which also requires the player entity) so a zone change doesn't split your logs.
+    manage_log_session(logged_in, real_logout)
 
-    -- A relog (logout to character select, then back in) drops a session divider into the tabs,
-    -- the same way a fresh addon load does after restoring history. Keyed on the character actually
-    -- reaching the logged-OUT state (GetLoginStatus() == 0, i.e. character select / POL), NOT on
-    -- any dip out of "in game" -- a zone change briefly reports "loading" (1) or makes the read
-    -- fail, and treating those as a logout produced a spurious divider on every warp/teleport.
-    -- The very first login after load is left to restore_history below (it resets saw_logout), so
-    -- a logged-out state seen before that first login doesn't count as a relog.
-    if okStatus and loginStatus == 0 then sbreak.saw_logout = true end
+    -- A relog drops a session divider into the tabs, the same way a fresh addon load does after
+    -- restoring history. The very first login after load is left to restore_history below (it
+    -- resets saw_logout), so a logged-out state seen before that first login isn't a relog.
+    if real_logout then sbreak.saw_logout = true end
     if logged_in and sbreak.saw_logout and history_restored then
         sbreak.push()
         sbreak.saw_logout = false
