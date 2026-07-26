@@ -210,6 +210,9 @@ local default_config = {
     dedupe_sec       = 1.5,   -- window for duplicate suppression
     timestamp_format = 'hms', -- 'hms' (HH:MM:SS) | 'hm' (HH:MM)
     timestamp_12h    = false, -- false = 24-hour, true = 12-hour with AM/PM
+    hide_during_events = false, -- hide all windows during cutscenes/events (messages still captured)
+    autohide_ls2 = true,        -- hide the LS2 tab unless you're actually in a second linkshell
+    ls_names = {},              -- learned linkshell names for the window titles: {linkshell=, linkshell2=}
     shoutyell_filter = 'both', -- 'both' | 'shout' | 'yell' -- which to show in the Shout/Yell channel
     craft_filter     = 'all', -- 'all' | 'mine' -- who to show in the Craft channel
     combat_filter    = 'all', -- 'all' | 'mine' -- who to show in the Combat channel
@@ -276,6 +279,9 @@ local function apply_cfg_defaults(c)
     if c.shoutyell_filter ~= 'shout' and c.shoutyell_filter ~= 'yell' then c.shoutyell_filter = 'both' end
     if c.persist_history == nil then c.persist_history = true end
     if c.enable_logging == nil then c.enable_logging = false end
+    if c.hide_during_events == nil then c.hide_during_events = false end
+    if c.autohide_ls2 == nil then c.autohide_ls2 = true end
+    if type(c.ls_names) ~= 'table' then c.ls_names = {} end
 
     -- Auto pop-out settings (open on trigger; close is its own separate toggle).
     c.autopop = (type(c.autopop) == 'table') and c.autopop or {}
@@ -588,7 +594,8 @@ end
 -- is drawn in a bright color, and the whole row gets a faint background tint. First-pass colors,
 -- easy to tweak.
 local MENTION_NAME_COLOR = {255/255, 240/255, 120/255, 1.0}  -- bright yellow: your name in the text
-local MENTION_TINT_COLOR = {255/255, 225/255, 120/255, 0.10} -- faint warm wash behind the row
+-- (mention row tint -- a faint warm wash {255/255,225/255,120/255,0.10} -- is inlined at its one
+-- use in the draw loop to save a top-level local near Lua's 200 cap.)
 
 -- Finds whole-word (case-insensitive) occurrences of `name` in `text`, as {s, e} char ranges.
 -- Whole-word so a name that's a prefix of a longer word (e.g. "Sprort" inside "Sprortacus")
@@ -779,9 +786,10 @@ end
 -- A "session break" is a special row (is_break = true, no username/message) that renders as a red
 -- rule across the tab, marking where a logout/login or an addon reload separates the previous
 -- session's messages from this one. Kept on one table to avoid adding several top-level locals
--- (this file sits near Lua's 200-locals-per-chunk cap). Not persisted -- on reload the restored
--- history is one block and a single fresh break is dropped at its end; relog breaks show for the
--- session but are replaced by that single break the next time history is restored.
+-- (this file sits near Lua's 200-locals-per-chunk cap). Persisted with history so past breaks stay
+-- visible in the chat scrollback across reloads (see snapshot_row/restore_history) -- but they
+-- never reach the plain-text log FILES, since breaks are pushed straight to the buffer and never
+-- go through queue_log.
 local sbreak = { color = {0.85, 0.25, 0.25, 1.0}, saw_logout = false }
 
 -- Append a break to every channel that has messages (skips empty tabs so there's never a leading
@@ -837,6 +845,10 @@ end
 -- loaded yet). The per-frame render caches (_wrap_lines, _ts_str, ...) are deliberately omitted;
 -- they rebuild on first draw.
 local function snapshot_row(e)
+    -- Session-break rows carry no text -- persist just enough to redraw the red rule + its time, so
+    -- past session breaks survive a reload in the chat scrollback (they're never written to the log
+    -- files -- breaks bypass queue_log entirely).
+    if e.is_break then return { epoch = e.epoch, is_break = true } end
     return {
         epoch = e.epoch, username = e.username, message = e.message,
         text_color = e.text_color, uname_color = e.uname_color,
@@ -857,7 +869,7 @@ local function save_history()
             local i = 0
             buf:each(function(e)
                 i = i + 1
-                if i > first and not e.is_break then rows[#rows + 1] = snapshot_row(e) end
+                if i > first then rows[#rows + 1] = snapshot_row(e) end   -- includes session breaks
             end)
             if #rows > 0 then data[ch] = rows end
         end
@@ -889,7 +901,9 @@ local function restore_history()
         local buf = chat.messages[ch]
         if buf and type(rows) == 'table' then
             for _, e in ipairs(rows) do
-                if type(e) == 'table' and type(e.message) == 'string' then
+                if type(e) == 'table' and e.is_break then
+                    buf:push({ epoch = e.epoch or os.time(), is_break = true })   -- past session divider
+                elseif type(e) == 'table' and type(e.message) == 'string' then
                     buf:push({
                         epoch = e.epoch or os.time(), username = e.username or '', message = e.message,
                         text_color = e.text_color, uname_color = e.uname_color,
@@ -1216,7 +1230,10 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
     if not target then target, tmsg = cmdline:match('^/t%s+(%S+)%s+(.+)$') end
     if target and tmsg then
         tmsg = clean_str(tmsg)
-        append_message('tell', '>>' .. target, tmsg, false)
+        -- no_alert=true: Tell is an always-alert channel, but an outgoing tell is something you
+        -- just typed, so it shouldn't flash the tab -- only incoming tells should. (Same treatment
+        -- as own outgoing say/shout/yell.)
+        append_message('tell', '>>' .. target, tmsg, false, nil, nil, nil, true)
         return
     end
 end)
@@ -1331,7 +1348,7 @@ local DAMAGE_COLOR     = {255/255,  90/255,  90/255, 1.0} -- red: damage dealt/t
 local HEAL_COLOR       = {120/255, 200/255, 255/255, 1.0} -- light blue: curing/recovery
 local ITEM_COLOR       = {1,       1,       1,       1.0} -- white: item drops/who received them
 local EXP_COLOR        = {110/255, 220/255, 110/255, 1.0} -- green: experience points gained (also level up)
-local LEVEL_DOWN_COLOR = {255/255, 150/255, 150/255, 1.0} -- light red: level down
+-- (level-down light red {255/255,150/255,150/255,1.0} is inlined at its one pattern below.)
 local STATUS_COLOR     = {195/255, 130/255, 255/255, 1.0} -- purple: status effects landing (ailments and buffs)
 -- Combat rows show the body in this neutral gray and tint only the meaningful tokens (numbers, and
 -- the spell/ability/effect name) in the line's type color -- see system_row_style. Coloring the
@@ -1600,7 +1617,7 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- originally-guessed "loses a level!". Experience is still NOT verified and may need fixing.
     { channel = 'combat', pattern = "^(.-) gains %d+ experience points?%.$",            color = EXP_COLOR },
     { channel = 'combat', pattern = "^(.-) attains level %d+!?$",                       color = EXP_COLOR },
-    { channel = 'combat', pattern = "^(.-) falls to level %d+%.$",                      color = LEVEL_DOWN_COLOR },
+    { channel = 'combat', pattern = "^(.-) falls to level %d+%.$",                      color = {255/255, 150/255, 150/255, 1.0} },
 
     -- Craft: synthesis results -- native log shows both in plain white, not the craft tab's
     -- default orange. The "lost" wording was previously wrong ("lost the .- ingredients.",
@@ -2113,16 +2130,18 @@ local function try_broadcast_message(msg)
     -- Username takes the same color as the message text, so the whole row reads as one
     -- broadcast regardless of which tab it turns up in (rather than picking up each channel's
     -- own username color). Passed explicitly as uname_color -- see draw_channel_messages.
+    -- Still shown in every tab, but only SYS is allowed to *alert* (no_alert=true everywhere
+    -- else): the copy is everywhere for visibility, without flashing every tab you're not on.
     if msg:match("^Achievement Unlocked:") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
-            append_message(ch, 'Achievement', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR)
+            append_message(ch, 'Achievement', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR, nil, ch ~= 'sys')
         end
         return true
     end
 
     if msg:match("^★ .- has reached level %d+ on .- as a hardcore character! ★$") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
-            append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR)
+            append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR, nil, ch ~= 'sys')
         end
         return true
     end
@@ -2351,7 +2370,32 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
 
     for line in (msg .. '\n'):gmatch('(.-)\r?\n') do
         if line ~= '' then
-            if try_broadcast_message(line) then
+            -- Linkshell MOTD, printed by the client on login / equipping a linkshell as a two-line
+            -- block:  "[N] < LSNAME: SETTER >"  then  "<the MOTD> (YYYY, Mon. DD HH:MM:SS)".
+            -- The header gives the linkshell's name (used for the window title -- see
+            -- chat.title_suffix) and which LS it is; the following line is the MOTD body, routed
+            -- into that LS tab. `_ls_motd_pending` carries the target across to the body line
+            -- (they can arrive in the same event or consecutive ones).
+            local lsnum, lsname = line:match('^%[([12])%]%s*<%s*(.-)%s*:%s*.-%s*>%s*$')
+            local motd_handled = false
+            if lsnum and lsname and lsname ~= '' then
+                local ch = (lsnum == '2') and 'linkshell2' or 'linkshell'
+                cfg.ls_names[ch] = lsname
+                chat._ls_motd_pending = ch
+                motd_handled = true
+            elseif chat._ls_motd_pending and line:match('%(%d+,%s*%a+%.%s*%d+%s+%d+:%d+:%d+%)') then
+                local ch = chat._ls_motd_pending
+                chat._ls_motd_pending = nil
+                local body = line:gsub('%s*%(%d+,%s*%a+%.%s*%d+%s+%d+:%d+:%d+%).-$', ''):gsub('^%s+', ''):gsub('%s+$', '')
+                if body ~= '' then append_message(ch, 'MOTD', body, true, nil, nil, nil, true) end
+                motd_handled = true
+            else
+                chat._ls_motd_pending = nil   -- header wasn't immediately followed by its body
+            end
+
+            if motd_handled then
+                -- already handled as a linkshell MOTD line
+            elseif try_broadcast_message(line) then
                 -- Achievement unlock / hardcore-character milestone -- already fully handled
                 -- (broadcast to every tab), regardless of what mode it arrived under.
             elseif is_auction_house_message(line) then
@@ -2813,7 +2857,7 @@ local function draw_channel_messages(channel)
                 end
                 local row_text_color = entry.text_color or text_color
                 local row_uname_color = entry.uname_color or uname_color
-                local tint = entry.mention and MENTION_TINT_COLOR or nil
+                local tint = entry.mention and {255/255, 225/255, 120/255, 0.10} or nil
                 draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, i, msg_col_x, entry.spans, entry, tint)
             end
             if y0 then
@@ -3144,6 +3188,16 @@ function sv.draw_general()
         if imgui.SliderInt('##linespacing', lref, 0, 8, '%dpx') then
             cfg.line_spacing = lref[1]
         end
+
+        imgui.Spacing()
+        local hde = { cfg.hide_during_events }
+        if imgui.Checkbox('Hide all windows during events (cutscenes)', hde) then cfg.hide_during_events = hde[1] end
+        imgui.TextWrapped('Hides every MultiChat window while a cutscene or event is playing. Messages are still captured -- they just aren\'t drawn until the event ends.')
+
+        imgui.Spacing()
+        local ah2 = { cfg.autohide_ls2 }
+        if imgui.Checkbox('Hide the LS2 tab unless in a second linkshell', ah2) then cfg.autohide_ls2 = ah2[1] end
+        imgui.TextWrapped('Shows the LS2 tab only when you actually have a second linkshell equipped.')
     else
         imgui.Text('Format:')
         if imgui.RadioButton('HH:MM:SS', cfg.timestamp_format == 'hms') then cfg.timestamp_format = 'hms' end
@@ -3304,6 +3358,26 @@ function sv.draw_window()
     if pushed_titlebar > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar) end) end
 end
 
+-- ===== Event (cutscene) detection =====
+-- Reads FFXI's event-system flag to tell when a cutscene/event is playing, so all windows can be
+-- hidden during it (see cfg.hide_during_events). Memory signature is the one the approved XIUI
+-- addon uses (core/gamestate.lua, credited there to Velyn); resolved once at load. Everything is
+-- pcall-guarded so a signature miss on some client build just disables the feature rather than
+-- erroring -- is_in_event() then always returns false and windows draw normally.
+local pEventSystem = 0
+pcall(function()
+    pEventSystem = ashita.memory.find('FFXiMain.dll', 0, 'A0????????84C0741AA1????????85C0741166A1????????663B05????????0F94C0C3', 0, 0)
+end)
+local function is_in_event()
+    if not pEventSystem or pEventSystem == 0 then return false end
+    local active = false
+    pcall(function()
+        local ptr = ashita.memory.read_uint32(pEventSystem + 1)
+        if ptr ~= 0 then active = (ashita.memory.read_uint8(ptr) == 1) end
+    end)
+    return active
+end
+
 -- ===== Auto pop-out =====
 -- Populated here (not at the forward declaration up top) now that pop/cfg/entity helpers exist.
 -- Every trigger returns its window `cfg.autopop.close_delay` seconds (a 0-120 slider) after the
@@ -3391,6 +3465,77 @@ function autopop.eval()
     end
 end
 
+-- ===== Stick-to-bottom scrolling =====
+-- Called right after a message child's content (and its trailing Dummy). Keeps the view pinned to
+-- the newest line, but RELEASES the moment you scroll up -- a wheel notch while hovering the
+-- window, or a drag more than a few lines -- so a single wheel click no longer snaps back; it
+-- re-sticks once you return to the bottom. Explicit stick state (per window `key`) is used instead
+-- of an "at bottom?" tolerance so the virtualized content-height wobble can't unstick it (which
+-- would flicker) and a small deliberate scroll-up isn't mistaken for being at the bottom.
+chat._stick = {}
+function chat.autoscroll(key)
+    local okY, y = pcall(imgui.GetScrollY)
+    local okM, my = pcall(imgui.GetScrollMaxY)
+    if not (okY and okM) or type(y) ~= 'number' or type(my) ~= 'number' then return end
+    local st = chat._stick
+    if st[key] == nil then st[key] = true end
+    local lineH = 18; pcall(function() lineH = imgui.GetTextLineHeightWithSpacing() end)
+    if not lineH or lineH <= 0 then lineH = 18 end
+    local wheel = 0; pcall(function() wheel = imgui.GetIO().MouseWheel end)
+    local hovered = false; pcall(function() hovered = imgui.IsWindowHovered() end)
+    if (hovered and wheel and wheel > 0) or (y < my - lineH * 3) then
+        st[key] = false                      -- user scrolled up -> stop pinning
+    end
+    if y >= my - 2 then st[key] = true end   -- returned to the bottom -> resume pinning
+    if st[key] then pcall(function() imgui.SetScrollHereY(1.0) end) end
+end
+
+-- ===== Second-linkshell detection (for hiding the LS2 tab) =====
+-- Linkshells aren't gear-slot equipment; they're linkshell-family items (Linkpearl/Linkshell/
+-- Pearlsack/Linksack -- the name reflects your rank) held in your inventory or satchel and equipped
+-- from the game menu. Confirmed in-game: an EQUIPPED one has non-zero item Flags, an unequipped one
+-- has Flags == 0. So "in a second linkshell" = at least two linkshell-family items are equipped.
+-- Result cached and re-scanned only every few seconds (membership changes rarely); kept on `chat`
+-- to avoid new top-level locals (near Lua's 200-per-chunk cap).
+-- Window-title suffix for a channel: " - <linkshell name>" for the LS1/LS2 tabs once their name is
+-- known (learned from the MOTD header -- see the text_in handler), empty for everything else.
+function chat.title_suffix(channel)
+    local name
+    if channel == 'linkshell' then name = cfg.ls_names.linkshell
+    elseif channel == 'linkshell2' then name = cfg.ls_names.linkshell2 end
+    if name and name ~= '' then return ' - ' .. name end
+    return ''
+end
+
+chat._ls2 = { visible = true, last = -999 }
+function chat.ls2_visible()
+    if not cfg.autohide_ls2 then return true end
+    local s = chat._ls2
+    local now = os.clock()
+    if (now - s.last) >= 3 then
+        s.last = now
+        local count = 0
+        pcall(function()
+            local inv = AshitaCore:GetMemoryManager():GetInventory()
+            local rm  = AshitaCore:GetResourceManager()
+            for _, bag in ipairs({0, 5}) do            -- inventory + mog satchel
+                for slot = 1, 80 do
+                    local it = inv:GetContainerItem(bag, slot)
+                    if it and it.Id and it.Id > 0 and (it.Flags or 0) ~= 0 then   -- non-zero flags = equipped
+                        local r = rm:GetItemById(it.Id)
+                        local nm = (r and r.Name and (r.Name[1] or '') or ''):lower()
+                        if nm:find('linkshell') or nm:find('linkpearl') or nm:find('pearlsack') or nm:find('linksack') then
+                            count = count + 1
+                        end
+                    end
+                end
+            end
+        end)
+        s.visible = (count >= 2)
+    end
+    return s.visible
+end
+
 -- Persist on unload
 ashita.events.register('unload', 'unload_cb', function ()
     pcall(save_history)
@@ -3442,19 +3587,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- Auto pop-out: evaluate the combat/party/craft triggers and pop/return tabs accordingly.
     pcall(autopop.eval)
 
-    -- One-time auto-check, the first frame this handler runs past the login gate above (i.e.
-    -- once, right after the character is confirmed loaded into the world -- same trigger this
-    -- gate already exists for). https.request is a blocking call, so this causes one brief
-    -- frame hitch -- same accepted tradeoff the approved anglin addon's own update checker
-    -- makes, at the same point in the login sequence.
-    if not update_check_done then
-        update_check_done = true
-        pcall(check_for_update)
-    end
-
     -- Restore saved history once, the first frame the character is known (buffers are still
     -- empty here -- nothing's arrived yet post-login -- so restored rows land in order), then
-    -- save periodically so a crash (which fires no unload) loses at most one interval.
+    -- save periodically so a crash (which fires no unload) loses at most one interval. Done
+    -- BEFORE the update check below so the update's SYS line appends after the restored SYS
+    -- history (at the bottom, newest) rather than above it.
     if not history_restored then
         history_restored = true
         pcall(restore_history)
@@ -3467,6 +3604,17 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         pcall(save_history)
     end
 
+    -- One-time auto-check, the first frame this handler runs past the login gate above (i.e.
+    -- once, right after the character is confirmed loaded into the world -- same trigger this
+    -- gate already exists for). https.request is a blocking call, so this causes one brief
+    -- frame hitch -- same accepted tradeoff the approved anglin addon's own update checker
+    -- makes, at the same point in the login sequence. Runs after history restore so its SYS
+    -- line lands at the bottom of the tab.
+    if not update_check_done then
+        update_check_done = true
+        pcall(check_for_update)
+    end
+
     if force_center_frames > 0 then force_center_frames = force_center_frames - 1 end
 
     -- Mirror the live popped-out state into the config so it's what gets saved. Done here, in
@@ -3477,6 +3625,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         for ch, state in pairs(pop) do cfg.popped[ch] = state.popped end
     end
 
+    -- Hide every window while a cutscene/event is playing. Messages are still captured (the packet
+    -- /text_in handlers run independently of this draw loop), just not drawn. Placed before any
+    -- style push so the early return leaves the imgui stack balanced.
+    if cfg.hide_during_events and is_in_event() then return end
+
     local pushed_accent = push_accent_colors()
 
     -- Isolated so a fault in the settings window can't abort the frame before the popped/main
@@ -3486,7 +3639,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- Popped-out windows
     for channel, state in pairs(pop) do
         if state.popped and state.is_open[1] then
-            local title = 'MultiChat - ' .. (channelLabels[channel] or channel)
+            local title = 'MultiChat - ' .. (channelLabels[channel] or channel) .. chat.title_suffix(channel)
             apply_window_bounds(channel)
             local pushed_titlebar = push_titlebar_color()
             imgui.PushStyleColor(ImGuiCol_WindowBg, {0.10, 0.10, 0.10, cfg.chat_bg_alpha or 0.25})
@@ -3518,16 +3671,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 imgui.PushStyleColor(ImGuiCol_ChildBg, {0,0,0,0})
                 if imgui.BeginChild(title .. 'Messages', {0, -imgui.GetFrameHeightWithSpacing() + 20}) then
                     apply_font_scale()
-                    local atBottom=false; local okY,y = pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                    -- See the split panes below: a few line-heights of tolerance (not 1px) so the
-                    -- virtualized content-height wobble doesn't flip "at bottom?" every frame.
-                    local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
-                    if okY and okM then atBottom = (y >= my - sbtol) end
                     draw_channel_messages(channel)
                     -- A few pixels of trailing space so descenders (y, g, p, q) on the last line
                     -- aren't clipped by the child's bottom edge when scrolled all the way down.
                     pcall(function() imgui.Dummy({0, 4}) end)
-                    if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
+                    chat.autoscroll('pop_' .. channel)
                 end
                 imgui.EndChild(); imgui.PopStyleColor(1)
             end
@@ -3545,7 +3693,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         -- "###MultiChatMain" keeps the window's actual ImGui ID stable while the visible title
         -- text changes with the active channel -- without it, changing the title string would
         -- make ImGui treat this as a brand-new window each time (losing position/size/focus).
-        local main_title = 'MultiChat - ' .. (channelLabels[chat.active_channel] or chat.active_channel) .. '###MultiChatMain'
+        local main_title = 'MultiChat - ' .. (channelLabels[chat.active_channel] or chat.active_channel) .. chat.title_suffix(chat.active_channel) .. '###MultiChatMain'
         if (imgui.Begin(main_title, chat.is_open)) then
             apply_font_scale()
             save_window_geom('main')
@@ -3614,9 +3762,19 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 imgui.SameLine()
             end
 
-            -- LEFT: channel buttons row
+            -- LEFT: channel buttons row. The LS2 tab is hidden unless you're in a second linkshell
+            -- (see chat.ls2_visible). If it was the active tab or the split's second pane, fall back
+            -- to a visible tab so nothing points at a hidden one.
+            local ls2_shown = chat.ls2_visible()
+            if not ls2_shown then
+                if chat.active_channel == 'linkshell2' then chat.active_channel = 'linkshell' end
+                if split.enabled and split.right_channel == 'linkshell2' then
+                    split.right_channel = (chat.active_channel ~= 'linkshell') and 'linkshell' or 'party'
+                end
+            end
+
             channel_button_with_menu('linkshell')
-            channel_button_with_menu('linkshell2')
+            if ls2_shown then channel_button_with_menu('linkshell2') end
             channel_button_with_menu('party')
             channel_button_with_menu('tell')
             channel_button_with_menu('say')
@@ -3698,17 +3856,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     imgui.BeginChild('MessagesTop', {availx, toph})
                     do
                         apply_font_scale()
-                        local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        -- Tolerance is a few line-heights, not 1px: the virtualized content
-                        -- height wobbles by a line or two as off-screen rows get measured, and a
-                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
-                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
-                        -- still un-sticking on a real scroll-up.
-                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
-                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
-                        if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
+                        chat.autoscroll('main')   -- single-pane, split top, and split left never coexist
                     end
                     imgui.EndChild()
 
@@ -3745,17 +3895,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 						imgui.Separator()
 
                         -- messages
-                        local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        -- Tolerance is a few line-heights, not 1px: the virtualized content
-                        -- height wobbles by a line or two as off-screen rows get measured, and a
-                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
-                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
-                        -- still un-sticking on a real scroll-up.
-                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
-                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(rch)
                         pcall(function() imgui.Dummy({0, 4}) end)
-                        if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
+                        chat.autoscroll('split_right')   -- split bottom + right never coexist
                     end
                     imgui.EndChild()
 
@@ -3775,17 +3917,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     imgui.BeginChild('MessagesLeft', {leftw, availy})
                     do
                         apply_font_scale()
-                        local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        -- Tolerance is a few line-heights, not 1px: the virtualized content
-                        -- height wobbles by a line or two as off-screen rows get measured, and a
-                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
-                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
-                        -- still un-sticking on a real scroll-up.
-                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
-                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
-                        if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
+                        chat.autoscroll('main')   -- single-pane, split top, and split left never coexist
                     end
                     imgui.EndChild()
 
@@ -3825,17 +3959,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 						imgui.Separator()
 
                         -- messages
-                        local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        -- Tolerance is a few line-heights, not 1px: the virtualized content
-                        -- height wobbles by a line or two as off-screen rows get measured, and a
-                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
-                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
-                        -- still un-sticking on a real scroll-up.
-                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
-                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(rch)
                         pcall(function() imgui.Dummy({0, 4}) end)
-                        if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
+                        chat.autoscroll('split_right')   -- split bottom + right never coexist
                     end
                     imgui.EndChild()
 
@@ -3845,17 +3971,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     -- Single-pane layout
                     if (imgui.BeginChild('MessagesWindow', {0, -imgui.GetFrameHeightWithSpacing() + 20})) then
                         apply_font_scale()
-                        local atBottom=false; local okY,y=pcall(imgui.GetScrollY); local okM,my=pcall(imgui.GetScrollMaxY)
-                        -- Tolerance is a few line-heights, not 1px: the virtualized content
-                        -- height wobbles by a line or two as off-screen rows get measured, and a
-                        -- tight threshold made "at bottom?" flip every frame -> auto-scroll snap
-                        -- flicker. A few lines absorbs the wobble (it happens above the fold) while
-                        -- still un-sticking on a real scroll-up.
-                        local sbtol = 1.0; pcall(function() sbtol = imgui.GetTextLineHeightWithSpacing() * 3 end)
-                        if okY and okM then atBottom = (y >= my - sbtol) end
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
-                        if atBottom then pcall(function() imgui.SetScrollHereY(1.0) end) end
+                        chat.autoscroll('main')   -- single-pane, split top, and split left never coexist
                     end
                     imgui.EndChild()
                 end

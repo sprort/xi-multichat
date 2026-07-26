@@ -35,7 +35,7 @@ Built and tested on HorizonXI; should work on any Ashita v4 server.
 - A red divider marks each session break (logout/login or addon reload), separating the previous session from the current one
 - Stays hidden until you're logged in — safe to auto-load from `default.txt`
 
-**Settings** (⚙): transparency, font size, line spacing, timestamp format, and per-channel or global colors.
+**Settings** (⚙): transparency, font size, line spacing, timestamp format, per-channel or global colors, and hiding all windows during cutscenes/events.
 
 Craft/Combat and Shout/Yell filters apply retroactively to messages already captured, not just new ones.
 
