@@ -123,6 +123,12 @@ local settings_ui = {
     subtab = {},    -- [category index] = selected top-tab index within that section
 }
 
+-- Auto pop-out feature state. Forward-declared here (populated far below, once pop/cfg/entity
+-- helpers exist) so append_message -- defined earlier than that -- can stamp craft activity onto
+-- it. `last_craft` is the os.clock() of the most recent self synth/fishing line; state/owned track
+-- per-channel trigger edges and which windows auto-pop opened (so auto-close only closes those).
+local autopop = { last_craft = 0, state = {}, owned = {}, close_at = {} }
+
 -- Measured width (in pixels) of the main window's Pop Out/Split/Copy/Settings button cluster,
 -- used to right-align it flush against the window's edge. Self-corrected every frame (see where
 -- it's used below) from the buttons' actual rendered rects rather than an estimated formula, so
@@ -214,6 +220,10 @@ local default_config = {
     -- second deliberate step; nothing is logged until you pick tabs. Normalized in apply_cfg_defaults.
     log_channels     = { linkshell=false, linkshell2=false, party=false, tell=false, say=false,
                          shout=false, craft=false, combat=false, quest=false, sys=false },
+    -- Automatic pop-out: when a trigger condition starts, pop that tab out into its own window;
+    -- when the condition ends, pop it back in -- but only if auto-pop was what opened it, so it
+    -- never overrides windows you popped yourself. Whole feature gated behind `enabled`.
+    autopop = { enabled = false, craft = true, combat = true, party = true, return_on_end = true, close_delay = 60 },
     -- Per-channel popped-out state. Window positions/sizes were already persisted (in `windows`
     -- above), which is why re-popping a window restores where it was -- but whether a channel
     -- was popped out at all wasn't, so a reload dropped every pop-out back into the main window.
@@ -266,6 +276,17 @@ local function apply_cfg_defaults(c)
     if c.shoutyell_filter ~= 'shout' and c.shoutyell_filter ~= 'yell' then c.shoutyell_filter = 'both' end
     if c.persist_history == nil then c.persist_history = true end
     if c.enable_logging == nil then c.enable_logging = false end
+
+    -- Auto pop-out settings (open on trigger; close is its own separate toggle).
+    c.autopop = (type(c.autopop) == 'table') and c.autopop or {}
+    if c.autopop.enabled       == nil then c.autopop.enabled       = false end
+    if c.autopop.craft         == nil then c.autopop.craft         = true  end
+    if c.autopop.combat        == nil then c.autopop.combat        = true  end
+    if c.autopop.party         == nil then c.autopop.party         = true  end
+    if c.autopop.return_on_end == nil then c.autopop.return_on_end = true  end
+    if type(c.autopop.close_delay) ~= 'number' then c.autopop.close_delay = 60 end
+    c.autopop.close_delay = math.floor(c.autopop.close_delay / 5 + 0.5) * 5   -- snap to 5s
+    if c.autopop.close_delay < 0 then c.autopop.close_delay = 0 elseif c.autopop.close_delay > 120 then c.autopop.close_delay = 120 end
 
     -- Per-tab logging selection: ensure a real boolean for every loggable channel. Missing entries
     -- default to false -- you opt each tab in explicitly after enabling "write logs to disk".
@@ -689,6 +710,12 @@ local function append_message(channel, username, msg, is_incoming, text_color, u
     local epoch = os.time()
     bucket:push({ epoch = epoch, username = username, message = msg, text_color = text_color, uname_color = uname_color, spans = spans, kind = kind, mention = mention })
     if queue_log then queue_log(channel, epoch, username, msg) end
+    -- Note your own synth/fishing activity for the Craft auto-pop trigger (there's no persistent
+    -- "crafting" status to poll, so recent self-authored Craft lines stand in for "actively
+    -- crafting/fishing"). Only self lines count -- another angler's catch shouldn't pop your tab.
+    if channel == 'craft' and pname ~= '' and username:lower() == pname:lower() then
+        autopop.last_craft = os.clock()
+    end
     if not no_alert then
         mark_alert_if_needed(channel, mention)
     end
@@ -1311,9 +1338,8 @@ local STATUS_COLOR     = {195/255, 130/255, 255/255, 1.0} -- purple: status effe
 -- whole line made stacks of same-type lines (a page of casts, a flurry of hits) blur together.
 local COMBAT_NEUTRAL_COLOR = {0.82, 0.82, 0.85, 1.0}
 
--- Default text color for the SYS tab (general system messages/broadcasts) -- an easy-to-read
--- light purple, matching the shade FFXI's own system text traditionally uses.
-local SYSTEM_TEXT_COLOR = {180/255, 150/255, 255/255, 1.0}
+-- (SYS tab general system text uses an inline light-purple literal at its one call site below --
+-- {180/255, 150/255, 255/255, 1.0} -- kept inline to save a top-level local near Lua's 200 cap.)
 
 -- Auction House messages within SYS get their own color and don't trigger SYS's normal
 -- always-alert behavior -- confirmed via in-game screenshot (the "Merchandise placed on
@@ -2370,7 +2396,7 @@ ashita.events.register('text_in', 'multichat_text_in_cb', function (e)
                 local color = (kind == 'shout') and SHOUT_TEXT_COLOR or YELL_TEXT_COLOR
                 append_message('shout', name, body, true, color, nil, nil, false, kind)
             elseif mode == SYSTEM_MODE then
-                append_message('sys', 'System', line, true, SYSTEM_TEXT_COLOR)
+                append_message('sys', 'System', line, true, {180/255, 150/255, 255/255, 1.0})
             elseif mode == EMOTE_MODE then
                 try_party_emote(line)
             elseif not (mode and ORDINARY_CHAT_MODES[mode]) then
@@ -2956,7 +2982,7 @@ end
 local sv = {}
 sv.SIDEBAR_W = 132
 sv.ACCENT = TITLEBAR_ACTIVE
-sv.categories = { 'General', 'Colors', 'Channels', 'History & Logging', 'Help' }
+sv.categories = { 'General', 'Colors', 'Channels', 'Auto Pop-Out', 'History & Logging', 'Help' }
 
 -- Compact color-swatch flags: opens the full picker on click, no inline RGBA fields, with an
 -- alpha bar -- matching XIUI's controls. Guarded with `or 0` in case a given Ashita build
@@ -3209,6 +3235,42 @@ function sv.draw_help()
     end
 end
 
+function sv.draw_autopop()
+    local a = cfg.autopop
+    local en = { a.enabled }
+    if imgui.Checkbox('Enable automatic pop-out', en) then a.enabled = en[1] end
+    imgui.TextWrapped('Automatically pop a tab out into its own window when its activity begins.')
+
+    if a.enabled then
+        imgui.Spacing()
+        imgui.Text('Pop out when:')
+        imgui.Indent(12)
+        local c = { a.combat }
+        if imgui.Checkbox('You enter combat  -> Combat', c) then a.combat = c[1] end
+        local cr = { a.craft }
+        if imgui.Checkbox('You craft or fish  -> Craft', cr) then a.craft = cr[1] end
+        local p = { a.party }
+        if imgui.Checkbox('You join a party  -> Party', p) then a.party = p[1] end
+        imgui.Unindent(12)
+
+        imgui.Spacing(); imgui.Spacing()
+        local r = { a.return_on_end }
+        if imgui.Checkbox('Auto-close: return the window when the activity ends', r) then a.return_on_end = r[1] end
+        imgui.TextWrapped('When on, an auto-popped window folds back into the main window once the activity stops (combat ends, you leave the party, or you stop crafting/fishing). Only windows that auto-pop opened are affected -- ones you pop out yourself are left alone.')
+
+        if a.return_on_end then
+            imgui.Spacing()
+            imgui.Text('Auto-close delay:')
+            local d = { a.close_delay or 60 }
+            imgui.SetNextItemWidth(220)
+            if imgui.SliderInt('##autopop_delay', d, 0, 120, '%d s') then
+                a.close_delay = math.floor(d[1] / 5 + 0.5) * 5   -- snap to 5s steps
+            end
+            imgui.TextWrapped('How long after the activity ends before the window returns (0 = immediately). Combat and Party wait this long as a grace period; Craft closes this long after your last synth/cast.')
+        end
+    end
+end
+
 -- Settings window: left sidebar of sections, each with its own top sub-tabs / content.
 function sv.draw_window()
     if not settings_ui.is_open[1] then return end
@@ -3233,12 +3295,100 @@ function sv.draw_window()
         if cat == 1 then sv.draw_general()
         elseif cat == 2 then sv.draw_colors()
         elseif cat == 3 then sv.draw_channels()
-        elseif cat == 4 then sv.draw_history()
+        elseif cat == 4 then sv.draw_autopop()
+        elseif cat == 5 then sv.draw_history()
         else sv.draw_help() end
         imgui.EndChild()
     end
     imgui.End()
     if pushed_titlebar > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar) end) end
+end
+
+-- ===== Auto pop-out =====
+-- Populated here (not at the forward declaration up top) now that pop/cfg/entity helpers exist.
+-- Every trigger returns its window `cfg.autopop.close_delay` seconds (a 0-120 slider) after the
+-- activity ends.
+--   Combat/Party: an instant status ends the moment you disengage / leave, so they wait the delay
+--                 as a grace before closing (cancelled if the status returns first).
+--   Craft:        there's no "crafting" status, so "active" means a self synth/fishing line within
+--                 the last `close_delay` seconds; that window IS the delay, so it closes as soon as
+--                 the window lapses (grace 0) -- also ~`close_delay` after your last synth/cast.
+autopop.CLOSE_DELAY      = 60   -- fallback if a call omits the delay; real value is cfg-driven
+autopop.CRAFT_MIN_WINDOW = 5    -- floor for the craft window so it still registers activity when
+                                -- the slider is set very low (an instant window couldn't detect it)
+
+-- Applies one trigger's current state to its tab. Rising edge (off->on) pops the tab out and
+-- remembers auto-pop opened it. On the condition ending, auto-close waits `delay` seconds
+-- (cancelled if the condition returns first). It only ever returns a window auto-pop opened AND
+-- that auto-close is enabled for; a window you popped yourself is never touched, and if you
+-- manually pop an auto-opened one back in, ownership is released so we stop managing it.
+function autopop.apply(ch, cond, delay)
+    local prev = autopop.state[ch]
+    autopop.state[ch] = cond
+    local st = pop[ch]
+    if not st then return end
+
+    if cond then
+        autopop.close_at[ch] = nil                 -- activity resumed: cancel any pending close
+        if not prev and not st.popped then         -- rising edge: pop out
+            st.popped = true
+            st.is_open[1] = true
+            st.alert = false
+            autopop.owned[ch] = true
+        end
+    else
+        if prev then                               -- just ended: schedule the (possibly 0s) close
+            if cfg.autopop.return_on_end and autopop.owned[ch] and st.popped then
+                autopop.close_at[ch] = os.clock() + (delay or autopop.CLOSE_DELAY)
+            else
+                autopop.owned[ch] = false
+            end
+        end
+        if autopop.close_at[ch] and os.clock() >= autopop.close_at[ch] then
+            if autopop.owned[ch] and st.popped and cfg.autopop.return_on_end then st.popped = false end
+            autopop.owned[ch] = false
+            autopop.close_at[ch] = nil
+        end
+    end
+
+    -- You manually popped an auto-opened window back in: release it and drop any pending close.
+    if autopop.owned[ch] and not st.popped then
+        autopop.owned[ch] = false
+        autopop.close_at[ch] = nil
+    end
+end
+
+-- Evaluates the three triggers each frame (see apply). All reads are pcall-guarded; a failed read
+-- just leaves that trigger off for the frame rather than erroring the draw loop.
+function autopop.eval()
+    if not cfg.autopop.enabled then return end
+
+    if cfg.autopop.combat then
+        local engaged = false
+        pcall(function()
+            local mm = AshitaCore:GetMemoryManager()
+            local pidx = mm:GetParty():GetMemberTargetIndex(0)
+            engaged = (mm:GetEntity():GetStatus(pidx) == 1)   -- 1 = Engaged
+        end)
+        autopop.apply('combat', engaged, cfg.autopop.close_delay)
+    end
+
+    if cfg.autopop.party then
+        local inParty = false
+        pcall(function()
+            local party = AshitaCore:GetMemoryManager():GetParty()
+            local count = 0
+            for i = 0, 5 do if party:GetMemberIsActive(i) == 1 then count = count + 1 end end
+            inParty = count >= 2   -- slot 0 is you; 2+ means you're grouped
+        end)
+        autopop.apply('party', inParty, cfg.autopop.close_delay)
+    end
+
+    if cfg.autopop.craft then
+        local win = math.max(cfg.autopop.close_delay, autopop.CRAFT_MIN_WINDOW)
+        local active = autopop.last_craft > 0 and (os.clock() - autopop.last_craft) < win
+        autopop.apply('craft', active, 0)   -- window is the delay; close as soon as it lapses
+    end
 end
 
 -- Persist on unload
@@ -3288,6 +3438,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- preview or a zone/loading screen (GetPlayerEntity goes non-nil on char select before
     -- you've actually logged in, so GetLoginStatus() == 2 is the real "in the world" signal).
     if not logged_in or GetPlayerEntity() == nil then return end
+
+    -- Auto pop-out: evaluate the combat/party/craft triggers and pop/return tabs accordingly.
+    pcall(autopop.eval)
 
     -- One-time auto-check, the first frame this handler runs past the login gate above (i.e.
     -- once, right after the character is confirmed loaded into the world -- same trigger this
