@@ -792,51 +792,50 @@ end
 -- go through queue_log.
 local sbreak = { color = {0.85, 0.25, 0.25, 1.0}, saw_logout = false }
 
--- Append a break to every channel that has messages (skips empty tabs so there's never a leading
--- rule), unless that channel already ends in a break (avoids a double rule when you relog without
--- anything new arriving in between).
-function sbreak.push()
+-- Append a session-boundary divider to EVERY channel so the same boundary shows on all tabs, quiet
+-- or not. If a tab's last row is already a divider of the SAME kind (e.g. two reloads back to back
+-- with nothing arriving in between) it's refreshed in place rather than stacked. But a divider of a
+-- DIFFERENT kind -- a reload after a login, the common case on a tab that was quiet between logging
+-- in and reloading -- is appended, so both the "logged in" and "reloaded" boundaries stay visible.
+-- `reason` ('reload' | 'login') and `who` (character name, for login) drive the label (sbreak.draw).
+function sbreak.push(reason, who)
     local now = os.time()
     for _, buf in pairs(chat.messages) do
-        if buf.count and buf.count > 0 then
-            local last = buf:last()
-            if not (last and last.is_break) then
-                buf:push({ epoch = now, is_break = true })
-            end
+        local last = buf:last()
+        if last and last.is_break and last.reason == reason then
+            last.epoch = now; last.who = who
+        else
+            buf:push({ epoch = now, is_break = true, reason = reason, who = who })
         end
     end
 end
 
--- Renders a break row: a red rule across the tab with the break's time centered on it, e.g.
--- "------ 08:06:05 ------". Everything pcall-guarded; if any imgui call is unavailable it just
--- draws the time label with no rule.
+-- The descriptive text for a break divider, e.g. "MultiChat reloaded at 08:06:05" or
+-- "Sprort logged in at 08:06:05". Falls back to just the time for older (pre-label) breaks.
+function sbreak.label(entry)
+    local t = format_timestamp(entry.epoch or os.time())
+    if entry.reason == 'reload' then
+        return 'MultiChat reloaded at ' .. t
+    elseif entry.reason == 'login' then
+        return ((entry.who and entry.who ~= '') and entry.who or 'Character') .. ' logged in at ' .. t
+    end
+    return t
+end
+
+-- Renders a break row as a red dashed divider with the labeled time centered, e.g.
+-- "----- MultiChat reloaded at 08:06:05 -----": five literal dashes on each side, centered in the tab.
 function sbreak.draw(entry)
     imgui.Spacing()
+    local text = '----- ' .. sbreak.label(entry) .. ' -----'
     local okAv, avail = pcall(imgui.GetContentRegionAvail)
-    local w = (okAv and avail) and get_x(avail) or 200
-    local label = format_timestamp(entry.epoch or os.time())
-    local okS, sz = pcall(imgui.CalcTextSize, label)
-    local tw = okS and get_x(sz) or (#label * 7)
-    local th = okS and get_y(sz) or 14
-    local okPos, pos = pcall(imgui.GetCursorScreenPos)
-    if okPos and pos then
-        local x, y = get_x(pos), get_y(pos)
-        local cy = y + th * 0.5
-        local gap = 8
-        local leftEnd = x + (w - tw) * 0.5 - gap
-        local rightStart = x + (w + tw) * 0.5 + gap
-        local dl = imgui.GetWindowDrawList()
-        if dl then
-            local u = imgui.GetColorU32(sbreak.color)
-            if leftEnd > x then dl:AddRectFilled({x, cy}, {leftEnd, cy + 1}, u) end
-            if rightStart < x + w then dl:AddRectFilled({rightStart, cy}, {x + w, cy + 1}, u) end
-        end
-    end
+    local w = (okAv and avail) and get_x(avail) or 0
+    local okS, sz = pcall(imgui.CalcTextSize, text)
+    local tw = (okS and sz) and get_x(sz) or 0
     local okCx, cx = pcall(imgui.GetCursorPosX)
-    local pad = (w - tw) * 0.5
-    if pad < 0 then pad = 0 end
-    if okCx and type(cx) == 'number' then pcall(function() imgui.SetCursorPosX(cx + pad) end) end
-    imgui.TextColored(sbreak.color, label)
+    if okCx and type(cx) == 'number' and w > tw then
+        pcall(imgui.SetCursorPosX, cx + (w - tw) * 0.5)
+    end
+    imgui.TextColored(sbreak.color, text)
     imgui.Spacing()
 end
 
@@ -848,7 +847,7 @@ local function snapshot_row(e)
     -- Session-break rows carry no text -- persist just enough to redraw the red rule + its time, so
     -- past session breaks survive a reload in the chat scrollback (they're never written to the log
     -- files -- breaks bypass queue_log entirely).
-    if e.is_break then return { epoch = e.epoch, is_break = true } end
+    if e.is_break then return { epoch = e.epoch, is_break = true, reason = e.reason, who = e.who } end
     return {
         epoch = e.epoch, username = e.username, message = e.message,
         text_color = e.text_color, uname_color = e.uname_color,
@@ -902,7 +901,7 @@ local function restore_history()
         if buf and type(rows) == 'table' then
             for _, e in ipairs(rows) do
                 if type(e) == 'table' and e.is_break then
-                    buf:push({ epoch = e.epoch or os.time(), is_break = true })   -- past session divider
+                    buf:push({ epoch = e.epoch or os.time(), is_break = true, reason = e.reason, who = e.who })   -- past session divider
                 elseif type(e) == 'table' and type(e.message) == 'string' then
                     buf:push({
                         epoch = e.epoch or os.time(), username = e.username or '', message = e.message,
@@ -913,8 +912,17 @@ local function restore_history()
             end
         end
     end
-    -- Mark the boundary between everything just restored (previous sessions) and this one.
-    sbreak.push()
+    -- Mark the boundary between everything just restored (previous sessions) and this one. This runs
+    -- once, on the first in-world frame after the addon loads. If a logged-out state (character
+    -- select, status 0) was seen before that frame, this load began at a genuine login, so it's a
+    -- "logged in" divider; otherwise the addon was reloaded mid-game ("reloaded"). The login-edge
+    -- check in d3d_present can't cover this first login because history_restored isn't set yet when
+    -- it runs, so the reason is decided here instead.
+    if sbreak.saw_logout then
+        sbreak.push('login', current_char_name())
+    else
+        sbreak.push('reload')
+    end
 end
 
 -- ===== Per-tab plain-text logging =====
@@ -957,16 +965,21 @@ end
 -- back-to-back logins that share the same day's file.
 local function write_log_header(channel)
     if log_headed[channel] then return end
+    log_headed[channel] = true
     if not log_dir_made then   -- mkdir the day's folder once per session, not per file/flush
         pcall(function() os.execute(string.format('mkdir "%s" 2>nul', log_session_dir())) end)
         log_dir_made = true
     end
+    -- Only write a "login" divider for a GENUINE login (a real logout to character select preceded
+    -- this session). An addon /reload starts a fresh session too, but that's not a login, so it
+    -- just resumes the day's file with no divider -- see chat._log_saw_logout, set on real logout.
     local f = io.open(log_file_path(channel), 'a')
     if f then
-        f:write(string.format('===== login %s %s =====\n', log_session_date, log_session_time))
-        f:close()
+        if chat._log_saw_logout then
+            f:write(string.format('===== login %s %s =====\n', log_session_date, log_session_time))
+        end
+        f:close()   -- still touches the file so a selected tab exists even before its first line
     end
-    log_headed[channel] = true
 end
 
 -- Runs every frame while logging is on: makes sure each selected tab's file exists (with this
@@ -1017,6 +1030,7 @@ end
 -- writing a spurious login divider on every warp/teleport. Called every frame from d3d_present.
 local function manage_log_session(logged_in, real_logout)
     if real_logout then
+        chat._log_saw_logout = true   -- a genuine logout happened -> the next session start is a real login
         if log_session_active then
             log_session_active = false
             pcall(flush_logs)
@@ -3569,7 +3583,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- resets saw_logout), so a logged-out state seen before that first login isn't a relog.
     if real_logout then sbreak.saw_logout = true end
     if logged_in and sbreak.saw_logout and history_restored then
-        sbreak.push()
+        sbreak.push('login', current_char_name())
         sbreak.saw_logout = false
     end
 
