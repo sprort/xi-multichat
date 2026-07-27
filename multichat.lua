@@ -212,6 +212,30 @@ local default_config = {
     timestamp_12h    = false, -- false = 24-hour, true = 12-hour with AM/PM
     hide_during_events = false, -- hide all windows during cutscenes/events (messages still captured)
     autohide_ls2 = true,        -- hide the LS2 tab unless you're actually in a second linkshell
+    show_collapse_arrow = false,-- show the title-bar collapse triangle on chat windows (off = cleaner title bar)
+    notes_show_collapse_arrow = false, -- same, but for the notes window only (independent of the above)
+    -- Accent colors for the window chrome (RGBA 0..1). Each is user-customizable with its own alpha,
+    -- so e.g. the title bar can be made translucent. Defaults reproduce the original blue theme; the
+    -- inactive/hover shades are derived from these at draw time. See push_titlebar_color / push_accent_colors.
+    accent = {
+        titlebar  = {0.16, 0.45, 0.78, 1.0},
+        resize    = {0.16, 0.45, 0.78, 1.0},
+        scrollbar = {0.16, 0.45, 0.78, 1.0},
+    },
+    -- Notes window colors, independent of the global chat transparency. `background` colors both the
+    -- plate and the text-input area (one setting) and carries its own alpha so the notes window can be
+    -- made transparent; `font` is the text color and stays opaque (its alpha is ignored). See notes_draw.
+    notes_colors = {
+        background = {0.10, 0.10, 0.10, 0.85},
+        font       = {0.95, 0.95, 0.95, 1.0},
+    },
+    -- Per-window background color + alpha (the main window and each channel's pop-out). When
+    -- windows_uniform is true, every window uses window_colors.main (a single global look); when
+    -- false, each uses its own. Filled/validated in apply_cfg_defaults (seeded from chat_bg_alpha so
+    -- existing installs keep their current transparency). See chat.window_bg.
+    windows_uniform = true,
+    window_colors = {},
+    last_exp_align = 'left',    -- alignment of the combat window's "Last EXP:" readout: 'left'|'center'|'right'
     ls_names = {},              -- learned linkshell names for the window titles: {linkshell=, linkshell2=}
     shoutyell_filter = 'both', -- 'both' | 'shout' | 'yell' -- which to show in the Shout/Yell channel
     craft_filter     = 'all', -- 'all' | 'mine' -- who to show in the Craft channel
@@ -246,6 +270,8 @@ local default_config = {
             party      = copy_color(channelColors.party),
             tell       = copy_color(channelColors.tell),
             say        = copy_color(channelColors.say),
+            shout      = copy_color(channelColors.shout),
+            quest      = copy_color(channelColors.quest),
         }},
         username = { per_channel = true, all = {1,1,1,1}, channels = {
             linkshell  = copy_color(channelColors.linkshell),
@@ -253,6 +279,8 @@ local default_config = {
             party      = copy_color(channelColors.party),
             tell       = copy_color(channelColors.tell),
             say        = copy_color(channelColors.say),
+            shout      = copy_color(channelColors.shout),
+            quest      = copy_color(channelColors.quest),
         }},
         text = { per_channel = true, all = {1,1,1,1}, channels = {
             linkshell  = copy_color(channelColors.linkshell),
@@ -260,6 +288,8 @@ local default_config = {
             party      = copy_color(channelColors.party),
             tell       = copy_color(channelColors.tell),
             say        = copy_color(channelColors.say),
+            shout      = copy_color(channelColors.shout),
+            quest      = copy_color(channelColors.quest),
         }},
     },
 }
@@ -287,6 +317,54 @@ local function apply_cfg_defaults(c)
     if c.log_retention_days < 0 then c.log_retention_days = 0 elseif c.log_retention_days > 3650 then c.log_retention_days = 3650 end
     if c.hide_during_events == nil then c.hide_during_events = false end
     if c.autohide_ls2 == nil then c.autohide_ls2 = true end
+    if c.show_collapse_arrow == nil then c.show_collapse_arrow = false end
+    if c.notes_show_collapse_arrow == nil then c.notes_show_collapse_arrow = false end
+
+    -- Accent colors: guarantee a valid {r,g,b,a} (each 0..1) for each chrome element.
+    c.accent = (type(c.accent) == 'table') and c.accent or {}
+    local accent_defaults = { titlebar = {0.16,0.45,0.78,1.0}, resize = {0.16,0.45,0.78,1.0}, scrollbar = {0.16,0.45,0.78,1.0} }
+    for key, dflt in pairs(accent_defaults) do
+        local t = (type(c.accent[key]) == 'table') and c.accent[key] or {}
+        for i = 1, 4 do
+            local v = t[i]
+            if type(v) ~= 'number' then v = dflt[i] end
+            if v < 0 then v = 0 elseif v > 1 then v = 1 end
+            t[i] = v
+        end
+        c.accent[key] = t
+    end
+
+    -- Notes colors: same {r,g,b,a} validation as accent.
+    c.notes_colors = (type(c.notes_colors) == 'table') and c.notes_colors or {}
+    local notes_color_defaults = { background = {0.10,0.10,0.10,0.85}, font = {0.95,0.95,0.95,1.0} }
+    for key, dflt in pairs(notes_color_defaults) do
+        local t = (type(c.notes_colors[key]) == 'table') and c.notes_colors[key] or {}
+        for i = 1, 4 do
+            local v = t[i]
+            if type(v) ~= 'number' then v = dflt[i] end
+            if v < 0 then v = 0 elseif v > 1 then v = 1 end
+            t[i] = v
+        end
+        c.notes_colors[key] = t
+    end
+
+    -- Per-window background colors: one {r,g,b,a} per window, seeded from the (old global) chat
+    -- transparency so existing configs look unchanged. Alpha is kept; rgb defaults to the dark plate.
+    if c.windows_uniform == nil then c.windows_uniform = true end
+    c.window_colors = (type(c.window_colors) == 'table') and c.window_colors or {}
+    local win_default = {0.10, 0.10, 0.10, (type(c.chat_bg_alpha) == 'number' and c.chat_bg_alpha or 0.25)}
+    for _, k in ipairs({'main','linkshell','linkshell2','party','tell','say','shout','craft','combat','quest','sys'}) do
+        local t = (type(c.window_colors[k]) == 'table') and c.window_colors[k] or {}
+        for i = 1, 4 do
+            local v = t[i]
+            if type(v) ~= 'number' then v = win_default[i] end
+            if v < 0 then v = 0 elseif v > 1 then v = 1 end
+            t[i] = v
+        end
+        c.window_colors[k] = t
+    end
+    if c.last_exp_align ~= 'center' and c.last_exp_align ~= 'right' then c.last_exp_align = 'left' end
+
     if type(c.ls_names) ~= 'table' then c.ls_names = {} end
 
     -- Auto pop-out settings (open on trigger; close is its own separate toggle).
@@ -486,17 +564,33 @@ local function apply_font_scale()
     pcall(function() imgui.SetWindowFontScale(cfg.font_scale or 1.0) end)
 end
 
--- Title bar color, applied to every addon window (main, popped-out, Settings). Must be pushed
--- before imgui.Begin() (title bar draws as part of Begin) and popped after End().
+-- Theme accent used for buttons, headers, checkmarks, sliders, and the settings swatch. The window
+-- title bar, scrollbar, and resize grip are separately user-customizable (cfg.accent) -- see
+-- push_titlebar_color / push_accent_colors -- but these two keep the whole non-chrome UI cohesive.
 local TITLEBAR_ACTIVE    = {0.16, 0.45, 0.78, 1.0}
 local TITLEBAR_INACTIVE  = {0.10, 0.28, 0.48, 1.0}
-local TITLEBAR_COLLAPSED = {0.10, 0.22, 0.38, 0.80}
+
+-- Title bar color, applied to every addon window (main, popped-out, Settings). Driven by
+-- cfg.accent.titlebar (RGBA, alpha included so the bar can be made translucent); the inactive and
+-- collapsed states are darker shades of it. Must be pushed before imgui.Begin() (the title bar
+-- draws as part of Begin) and popped after End(). shade() isn't in scope this early, so the
+-- darkening is inlined -- multiplying rgb down never leaves 0..1, so no clamp is needed.
+-- The background color+alpha for a given window ('main' or a channel key). With windows_uniform on,
+-- every window shares window_colors.main; otherwise each uses its own (falling back to main).
+function chat.window_bg(key)
+    local wc = cfg.window_colors
+    if type(wc) ~= 'table' then return {0.10, 0.10, 0.10, cfg.chat_bg_alpha or 0.25} end
+    if cfg.windows_uniform then return wc.main or {0.10, 0.10, 0.10, 0.25} end
+    return wc[key] or wc.main or {0.10, 0.10, 0.10, 0.25}
+end
 
 local function push_titlebar_color()
+    local tb = (cfg.accent and cfg.accent.titlebar) or TITLEBAR_ACTIVE
+    local a = tb[4] or 1.0
     local pushed = 0
-    if pcall(function() imgui.PushStyleColor(ImGuiCol_TitleBg, TITLEBAR_INACTIVE) end) then pushed = pushed + 1 end
-    if pcall(function() imgui.PushStyleColor(ImGuiCol_TitleBgActive, TITLEBAR_ACTIVE) end) then pushed = pushed + 1 end
-    if pcall(function() imgui.PushStyleColor(ImGuiCol_TitleBgCollapsed, TITLEBAR_COLLAPSED) end) then pushed = pushed + 1 end
+    if pcall(function() imgui.PushStyleColor(ImGuiCol_TitleBg, { tb[1]*0.62, tb[2]*0.62, tb[3]*0.62, a }) end) then pushed = pushed + 1 end
+    if pcall(function() imgui.PushStyleColor(ImGuiCol_TitleBgActive, tb) end) then pushed = pushed + 1 end
+    if pcall(function() imgui.PushStyleColor(ImGuiCol_TitleBgCollapsed, { tb[1]*0.55, tb[2]*0.55, tb[3]*0.55, a }) end) then pushed = pushed + 1 end
     return pushed
 end
 
@@ -1187,6 +1281,107 @@ end
 local SHOUT_TEXT_COLOR = {255/255, 170/255,  60/255, 1.0} -- orange: Shout
 local YELL_TEXT_COLOR  = {255/255,  90/255, 200/255, 1.0} -- pink/magenta: Yell
 
+-- ===== Notes (persistent scratch pad) =====
+-- A single free-form text buffer per character, saved to config/addons/multichat/notes/<char>.txt
+-- and restored on load and on relog. Toggled with /multichat notes or the Notes button on the main
+-- window. Plain text on disk -- no list, no per-line entries, no copy button (logging and the row
+-- right-click "Copy log" already cover that): just a scratch pad that survives reloads. Hung on the
+-- `chat` table rather than added as top-level locals, since this file sits near Lua's 200-per-chunk
+-- limit. Uses config_base_dir/current_char_name (both defined above).
+-- buf is a T{} (Ashita's table type), NOT a plain {} -- the imgui InputText binding needs it: with a
+-- plain table it silently ignores the size argument (box falls back to a default height) and doesn't
+-- report edits. Every working InputTextMultiline in the other addons uses a T{} buffer.
+chat.notes = { is_open = { false }, buf = T{ '' }, char = '', dirty = false, last_save = 0 }
+
+function chat.notes_path(c)
+    return config_base_dir() .. '\\notes\\' .. (c:gsub('[^%w]', '')) .. '.txt'
+end
+
+function chat.notes_save()
+    local n = chat.notes
+    if n.char == '' or not n.dirty then return end
+    pcall(function() os.execute(string.format('mkdir "%s" 2>nul', config_base_dir() .. '\\notes')) end)
+    local f = io.open(chat.notes_path(n.char), 'w')
+    if f then f:write(n.buf[1] or ''); f:close(); n.dirty = false end
+end
+
+function chat.notes_load(c)
+    local n = chat.notes
+    n.buf[1] = ''
+    local f = io.open(chat.notes_path(c), 'r')
+    if f then n.buf[1] = f:read('*a') or ''; f:close() end
+    n.char = c
+    n.dirty = false
+end
+
+-- Once a character is known: load their notes the first time (and on a relog to a DIFFERENT
+-- character, flushing the previous one first), then save on a 3s debounce whenever the buffer has
+-- unsaved edits, so a crash (no unload fired) loses at most a few seconds of typing.
+function chat.notes_sync()
+    local c = current_char_name()
+    if c == '' then return end
+    if c ~= chat.notes.char then
+        chat.notes_save()
+        chat.notes_load(c)
+    elseif chat.notes.dirty and (os.clock() - chat.notes.last_save) >= 3 then
+        chat.notes.last_save = os.clock()
+        chat.notes_save()
+    end
+end
+
+function chat.notes_draw()
+    if not chat.notes.is_open[1] then return end
+    local nc = cfg.notes_colors or { background = {0.10,0.10,0.10,0.85}, font = {0.95,0.95,0.95,1.0} }
+    local pushed_tb = push_titlebar_color()
+    -- The notes plate uses its OWN background color/alpha (cfg.notes_colors.background), not the global
+    -- chat transparency -- so the notes window is styled independently of every other MultiChat window.
+    local okBg = pcall(function() imgui.PushStyleColor(ImGuiCol_WindowBg, nc.background) end)
+    pcall(function() imgui.SetNextWindowSize({ 360, 320 }, ImGuiCond_FirstUseEver) end)
+    local flags = cfg.notes_show_collapse_arrow and 0 or (ImGuiWindowFlags_NoCollapse or 0)
+    if imgui.Begin('MultiChat - Notes###MultiChatNotes', chat.notes.is_open, flags) then
+        apply_font_scale()
+        -- Fill the window. GetContentRegionAvail returns TWO numbers (x, y) in this binding, not a
+        -- single ImVec2 -- capture both (floored to ints, which the size argument wants).
+        local w, h = 300, 240
+        do
+            local okc, a, b = pcall(imgui.GetContentRegionAvail)
+            if okc then
+                if type(a) == 'number' then
+                    w = a
+                    if type(b) == 'number' then h = b end
+                elseif a ~= nil then
+                    w = get_x(a); h = get_y(a)
+                end
+            end
+        end
+        w = math.floor(w); h = math.floor(h); if h < 40 then h = 40 end
+        -- Text-field background matches the window background (one setting), so the whole notes window
+        -- shares a single color/alpha; font color is opaque (its alpha is ignored). Pushed around the
+        -- input, then popped.
+        local pushed_field = 0
+        if pcall(function() imgui.PushStyleColor(ImGuiCol_FrameBg,        nc.background) end) then pushed_field = pushed_field + 1 end
+        if pcall(function() imgui.PushStyleColor(ImGuiCol_FrameBgHovered, nc.background) end) then pushed_field = pushed_field + 1 end
+        if pcall(function() imgui.PushStyleColor(ImGuiCol_FrameBgActive,  nc.background) end) then pushed_field = pushed_field + 1 end
+        if pcall(function() imgui.PushStyleColor(ImGuiCol_Text, { nc.font[1], nc.font[2], nc.font[3], 1.0 }) end) then pushed_field = pushed_field + 1 end
+        -- Drop the input box's frame border so the text field blends seamlessly into the window plate.
+        local pushed_var = 0
+        if pcall(function() imgui.PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0) end) then pushed_var = pushed_var + 1 end
+        -- A plain multiline scratch pad. Long lines scroll horizontally: ImGui text boxes have no
+        -- soft-wrap, and Ashita's binding doesn't surface the InputText callback data that would be
+        -- needed to wrap live, so scrolling is the robust single-box behavior (see also every other
+        -- Ashita addon's text box). 4 args only -- the binding has no flags parameter. Buffer is a T{}.
+        local ok, changed = pcall(function()
+            return imgui.InputTextMultiline('##notes_text', chat.notes.buf, 16384, { w, h })
+        end)
+        if pushed_var > 0 then pcall(function() imgui.PopStyleVar(pushed_var) end) end
+        if pushed_field > 0 then pcall(function() imgui.PopStyleColor(pushed_field) end) end
+        if ok and changed then chat.notes.dirty = true end
+    end
+    imgui.End()
+    if okBg then pcall(function() imgui.PopStyleColor(1) end) end
+    if pushed_tb > 0 then pcall(function() imgui.PopStyleColor(pushed_tb) end) end
+end
+
 -- ===== Commands =====
 ashita.events.register('command', 'multichat_command_cb', function (e)
     local cmdline = e.command
@@ -1240,6 +1435,13 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
         return
     end
 
+    -- /multichat notes -- toggle the persistent scratch-pad window
+    if lower:startswith('/multichat notes') then
+        e.blocked = true
+        chat.notes.is_open[1] = not chat.notes.is_open[1]
+        return
+    end
+
     -- Outgoing say/shout/yell/tell/party/LS are captured from the send packet (0x0B5 / 0x0B6, see
     -- the packet_out handler below), not mirrored from the typed command -- the packet carries the
     -- client's fully token-substituted text (<job>, <t>, etc.), which the raw command line does not.
@@ -1274,6 +1476,8 @@ ashita.events.register('packet_in', 'packet_in_cb', function (e)
         if ch == 'say' and not character:match('^%a+$') then
             ch = 'quest'
         end
+        -- Drop custom-menu system tells (e.g. HorizonXI outpost teleporters) on the incoming side too.
+        if ch == 'tell' and character == '_CUSTOM_MENU' then return end
         -- Matches FFXI's own native convention for incoming tells (trailing ">>", vs. the
         -- leading ">>" outgoing tells use -- see the /tell command mirror above) -- the arrow
         -- points toward whichever side actually sent it.
@@ -1324,6 +1528,10 @@ ashita.events.register('packet_out', 'outgoing_packet', function (e)
             local text = struct.unpack('s', e.data, 0x15 + 1)
             if not text or text == '' then return end
             name = (name or ''):trimend('\x00')
+            -- HorizonXI's outpost-teleporter (and similar) menus send your selections as tells to a
+            -- special "_CUSTOM_MENU" target. They never reach the native log and aren't real chat, so
+            -- drop them instead of filling the Tell tab with menu navigation.
+            if name == '_CUSTOM_MENU' then return end
             text = text:gsub('%%', '%%%%')
             text = clean_str(text)
             if text == '' then return end
@@ -2667,7 +2875,7 @@ local function draw_colored_username(uname, ucolor)
 end
 
 -- Draw one row (copy on click + context)
-local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, spans, cache_entry, tint_color)
+local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color, row_full, row_id, msg_col_x, spans, cache_entry, tint_color, channel)
     -- Row background tint for name-mention lines. The row's height isn't known until it's drawn
     -- (wrapped rows vary), and a rect added to the draw list after the text would cover it, so
     -- the tint is drawn *before* the content using the height measured on the previous frame
@@ -2700,9 +2908,10 @@ local function draw_row(timestamp, uname, message, ucolor, ts_color, text_color,
     local hovered = imgui.IsItemHovered()
     if hovered and imgui.IsMouseClicked(0) then pcall(function() imgui.SetClipboardText(row_full) end) end
     if imgui.BeginPopupContextItem('rowmenu') then
-        if imgui.MenuItem('Copy line')    then pcall(function() imgui.SetClipboardText(row_full) end) end
-        if imgui.MenuItem('Copy name')    then pcall(function() imgui.SetClipboardText(uname) end) end
-        if imgui.MenuItem('Copy message') then pcall(function() imgui.SetClipboardText(message) end) end
+        -- Copy this one line (timestamp + name + message), or the whole tab's log. "Copy log" is the
+        -- former per-tab Copy button, now living here so pop-outs and tabs need no button of their own.
+        if imgui.MenuItem('Copy line') then pcall(function() imgui.SetClipboardText(row_full) end) end
+        if imgui.MenuItem('Copy log')  then copy_all(channel) end
         imgui.EndPopup()
     end
     imgui.PopID()
@@ -2885,7 +3094,7 @@ local function draw_channel_messages(channel)
                 local row_text_color = entry.text_color or text_color
                 local row_uname_color = entry.uname_color or uname_color
                 local tint = entry.mention and {255/255, 225/255, 120/255, 0.10} or nil
-                draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, i, msg_col_x, entry.spans, entry, tint)
+                draw_row(entry._ts_str, entry.username, entry.message, row_uname_color, ts_color, row_text_color, entry._row_full, i, msg_col_x, entry.spans, entry, tint, channel)
             end
             if y0 then
                 local y1; do local ok, p = pcall(imgui.GetCursorPos); if ok and p then y1 = get_y(p) end end
@@ -2917,12 +3126,15 @@ local function push_accent_colors()
     push(ImGuiCol_CheckMark,            TITLEBAR_ACTIVE)
     push(ImGuiCol_SliderGrab,           TITLEBAR_INACTIVE)
     push(ImGuiCol_SliderGrabActive,     TITLEBAR_ACTIVE)
-    push(ImGuiCol_ScrollbarGrab,        TITLEBAR_INACTIVE)
-    push(ImGuiCol_ScrollbarGrabHovered, shade(TITLEBAR_INACTIVE, 1.3))
-    push(ImGuiCol_ScrollbarGrabActive,  TITLEBAR_ACTIVE)
-    push(ImGuiCol_ResizeGrip,           TITLEBAR_INACTIVE)
-    push(ImGuiCol_ResizeGripHovered,    shade(TITLEBAR_INACTIVE, 1.3))
-    push(ImGuiCol_ResizeGripActive,     TITLEBAR_ACTIVE)
+    -- Scrollbar and resize grip use their own configurable accent color (alpha included, so they can
+    -- be made translucent); the grab/hover states are shades of it, the active state the full color.
+    local sb, rz = cfg.accent.scrollbar, cfg.accent.resize
+    push(ImGuiCol_ScrollbarGrab,        shade(sb, 0.62))
+    push(ImGuiCol_ScrollbarGrabHovered, shade(sb, 0.85))
+    push(ImGuiCol_ScrollbarGrabActive,  sb)
+    push(ImGuiCol_ResizeGrip,           shade(rz, 0.62))
+    push(ImGuiCol_ResizeGripHovered,    shade(rz, 0.85))
+    push(ImGuiCol_ResizeGripActive,     rz)
     push(ImGuiCol_Button,               TITLEBAR_INACTIVE)
     push(ImGuiCol_ButtonHovered,        shade(TITLEBAR_INACTIVE, 1.3))
     push(ImGuiCol_ButtonActive,         shade(TITLEBAR_INACTIVE, 0.85))
@@ -3003,7 +3215,7 @@ end
 
 -- Subset of the full channel order used by the Colors section -- Craft/Combat are excluded since
 -- their colors are fixed/message-type-based rather than user-configurable (see is_system_channel).
-local colorable_channel_order = {'linkshell','linkshell2','party','tell','say'}
+local colorable_channel_order = {'linkshell','linkshell2','party','tell','say','shout','quest'}
 local function pick_alternate_left(exclude)
     -- LOGGABLE_ORDER doubles as the canonical full channel order (same list).
     for _,c in ipairs(LOGGABLE_ORDER) do if c ~= exclude then return c end end
@@ -3053,12 +3265,15 @@ end
 local sv = {}
 sv.SIDEBAR_W = 132
 sv.ACCENT = TITLEBAR_ACTIVE
-sv.categories = { 'General', 'Colors', 'Channels', 'Auto Pop-Out', 'History & Logging', 'Help' }
+sv.categories = { 'General', 'Colors', 'Channels', 'Auto Pop-Out', 'History & Logging', 'Notes', 'Help' }
 
--- Compact color-swatch flags: opens the full picker on click, no inline RGBA fields, with an
--- alpha bar -- matching XIUI's controls. Guarded with `or 0` in case a given Ashita build
--- doesn't expose them (falls back to the default full editor).
-sv.COLOR_FLAGS = bit.bor(ImGuiColorEditFlags_NoInputs or 0, ImGuiColorEditFlags_AlphaBar or 0)
+-- Compact color-swatch flags: opens the full picker on click, no inline RGBA fields -- matching
+-- XIUI's controls. Guarded with `or 0` in case a given Ashita build doesn't expose them (falls back
+-- to the default full editor). Text colors (timestamp/username/chat) get NO alpha -- text shouldn't
+-- be transparent; the accent (window-chrome) pickers add an alpha bar so their transparency is
+-- adjustable.
+sv.COLOR_FLAGS  = bit.bor(ImGuiColorEditFlags_NoInputs or 0, ImGuiColorEditFlags_NoAlpha or 0)
+sv.ACCENT_FLAGS = bit.bor(ImGuiColorEditFlags_NoInputs or 0, ImGuiColorEditFlags_AlphaBar or 0)
 
 -- Defensive push helper (returns 1 on success, 0 on failure) so an unbalanced style stack can't
 -- survive a stray error mid-frame -- same discipline as the rest of this file's imgui wrappers.
@@ -3195,12 +3410,8 @@ function sv.draw_general()
     local cat = 1
     sv.tab_row(cat, { 'Display', 'Timestamps' })
     if sv.subtab(cat) == 1 then
-        imgui.Text('Chat background transparency:')
-        local aref = { math.floor(((cfg.chat_bg_alpha or 0.25) * 100) + 0.5) }
-        imgui.SetNextItemWidth(220)
-        if imgui.SliderInt('##transparency', aref, 0, 100, '%d%%') then
-            cfg.chat_bg_alpha = aref[1] / 100.0
-        end
+        imgui.TextWrapped('Window background color and transparency are set per window under Colors -> Windows (with an "all windows the same" option).')
+        imgui.Spacing()
 
         imgui.Text('Font size:')
         local fref = { math.floor(((cfg.font_scale or 1.0) * FONT_BASE_SIZE) + 0.5) }
@@ -3225,6 +3436,12 @@ function sv.draw_general()
         local ah2 = { cfg.autohide_ls2 }
         if imgui.Checkbox('Hide the LS2 tab unless in a second linkshell', ah2) then cfg.autohide_ls2 = ah2[1] end
         imgui.TextWrapped('Shows the LS2 tab only when you actually have a second linkshell equipped.')
+
+        imgui.Spacing()
+        local sca = { cfg.show_collapse_arrow }
+        if imgui.Checkbox('Show the title-bar collapse arrow', sca) then cfg.show_collapse_arrow = sca[1] end
+        imgui.TextWrapped('The triangle at the left of each window\'s title bar that collapses it. Off (default) keeps the title bar -- with the addon name, tab, and linkshell name -- but removes the arrow and double-click-to-collapse for a cleaner look.')
+
     else
         imgui.Text('Format:')
         if imgui.RadioButton('HH:MM:SS', cfg.timestamp_format == 'hms') then cfg.timestamp_format = 'hms' end
@@ -3239,12 +3456,43 @@ function sv.draw_general()
     end
 end
 
+-- Windows shown in the per-window background color list (matches the pop-out channels), plus 'main'.
+local window_color_order = {'main','linkshell','linkshell2','party','tell','say','shout','craft','combat','quest','sys'}
+
 function sv.draw_colors()
     local cat = 2
-    sv.tab_row(cat, { 'Timestamp', 'Username', 'Chat Text' })
+    sv.tab_row(cat, { 'Timestamp', 'Username', 'Chat Text', 'Windows', 'Accent' })
+    local sub = sv.subtab(cat)
+    if sub == 5 then
+        imgui.TextWrapped('Colors for the window chrome. The alpha bar sets transparency -- e.g. make the title bar see-through. These apply to every MultiChat window.')
+        imgui.Spacing()
+        imgui.ColorEdit4('Title bar##accent_titlebar', cfg.accent.titlebar, sv.ACCENT_FLAGS)
+        imgui.ColorEdit4('Resize grip##accent_resize', cfg.accent.resize, sv.ACCENT_FLAGS)
+        imgui.ColorEdit4('Scrollbar##accent_scrollbar', cfg.accent.scrollbar, sv.ACCENT_FLAGS)
+        return
+    elseif sub == 4 then
+        imgui.TextWrapped('Background color and transparency for each window (the notes window has its own under the Notes section). The alpha bar makes a window see-through.')
+        imgui.Spacing()
+        local uni = { cfg.windows_uniform }
+        if imgui.Checkbox('All windows use the main window\'s color', uni) then cfg.windows_uniform = uni[1] end
+        imgui.SameLine()
+        if imgui.Button('Reset##wincolors') then
+            local a = (type(cfg.chat_bg_alpha) == 'number') and cfg.chat_bg_alpha or 0.25
+            for _, k in ipairs(window_color_order) do cfg.window_colors[k] = {0.10, 0.10, 0.10, a} end
+        end
+        imgui.Spacing()
+        imgui.ColorEdit4('Main window##wincolor', cfg.window_colors.main, sv.ACCENT_FLAGS)
+        if not cfg.windows_uniform then
+            for _, ch in ipairs(window_color_order) do
+                if ch ~= 'main' then
+                    imgui.ColorEdit4((channelLabels[ch] or ch) .. '##wincolor', cfg.window_colors[ch], sv.ACCENT_FLAGS)
+                end
+            end
+        end
+        return
+    end
     imgui.TextWrapped('Craft and Combat use fixed colors by message type (abilities, damage, healing) instead of these settings.')
     imgui.Spacing()
-    local sub = sv.subtab(cat)
     if sub == 1 then sv.color_controls('timestamp')
     elseif sub == 2 then sv.color_controls('username')
     else sv.color_controls('text') end
@@ -3264,6 +3512,14 @@ function sv.draw_channels()
         imgui.Spacing()
         if imgui.RadioButton('Everyone##combat', cfg.combat_filter == 'all') then cfg.combat_filter = 'all' end
         if imgui.RadioButton('Myself##combat', cfg.combat_filter == 'mine') then cfg.combat_filter = 'mine' end
+        imgui.Spacing(); imgui.Spacing()
+        imgui.Text('"Last EXP:" alignment:')
+        if imgui.RadioButton('Left##lastexpalign', cfg.last_exp_align == 'left') then cfg.last_exp_align = 'left' end
+        imgui.SameLine()
+        if imgui.RadioButton('Center##lastexpalign', cfg.last_exp_align == 'center') then cfg.last_exp_align = 'center' end
+        imgui.SameLine()
+        if imgui.RadioButton('Right##lastexpalign', cfg.last_exp_align == 'right') then cfg.last_exp_align = 'right' end
+        imgui.TextWrapped('Alignment of the "Last EXP:" line on the popped-out Combat window.')
     else
         imgui.TextWrapped('What shows up in the Shout/Yell tab. Shout and Yell are always shown in different colors so they stay easy to tell apart.')
         imgui.Spacing()
@@ -3312,6 +3568,23 @@ function sv.draw_history()
         end
         imgui.TextWrapped('At login, any days older than this are deleted so the logs folder stays bounded (one folder per day per character). Set to 0 to keep everything forever.')
     end
+end
+
+function sv.draw_notes()
+    imgui.TextWrapped('A free-form scratch pad, saved per character and restored across reloads and relogs. Open it with the Notes button on the main window or /multichat notes.')
+    imgui.Spacing()
+    local no = { chat.notes.is_open[1] }
+    if imgui.Checkbox('Show the notes window', no) then chat.notes.is_open[1] = no[1] end
+    local nca = { cfg.notes_show_collapse_arrow }
+    if imgui.Checkbox('Show the title-bar collapse arrow##notes', nca) then cfg.notes_show_collapse_arrow = nca[1] end
+    imgui.Spacing()
+    imgui.TextWrapped('Type freely and resize the window however you like. Long lines scroll sideways -- ImGui text boxes can\'t word-wrap while editing -- so press Enter for new lines where you want them.')
+
+    imgui.Spacing(); imgui.Spacing()
+    imgui.Text('Colors:')
+    imgui.ColorEdit4('Window##notes_col', cfg.notes_colors.background, sv.ACCENT_FLAGS)
+    imgui.ColorEdit4('Font##notes_col', cfg.notes_colors.font, sv.COLOR_FLAGS)
+    imgui.TextWrapped('The notes window is styled on its own, separate from the global chat transparency. The window color includes an alpha bar so the whole window (plate and text field) can be made transparent; font color is always opaque.')
 end
 
 function sv.draw_help()
@@ -3387,6 +3660,7 @@ function sv.draw_window()
         elseif cat == 3 then sv.draw_channels()
         elseif cat == 4 then sv.draw_autopop()
         elseif cat == 5 then sv.draw_history()
+        elseif cat == 6 then sv.draw_notes()
         else sv.draw_help() end
         imgui.EndChild()
     end
@@ -3575,11 +3849,31 @@ end
 -- Persist on unload
 ashita.events.register('unload', 'unload_cb', function ()
     pcall(save_history)
+    pcall(chat.notes_save)
     pcall(flush_logs)
     if have_settings and type(settings.save) == 'function' then
         pcall(settings.save)
     end
 end)
+
+-- Draws the popped-out Combat window's "Last EXP:" readout (fixed EXP color), aligned left / center /
+-- right per cfg.last_exp_align. Center/right shift the cursor by the leftover width before drawing.
+function chat.draw_last_exp()
+    local label = 'Last EXP: ' .. (last_exp_gained and tostring(last_exp_gained) or '-')
+    local align = cfg.last_exp_align or 'left'
+    if align ~= 'left' then
+        local okAv, avail = pcall(imgui.GetContentRegionAvail)
+        local w = (okAv and avail) and get_x(avail) or 0
+        local okSz, sz = pcall(imgui.CalcTextSize, label)
+        local tw = (okSz and sz) and get_x(sz) or 0
+        local okCx, cx = pcall(imgui.GetCursorPosX)
+        if okCx and type(cx) == 'number' and w > tw then
+            local pad = (align == 'center') and (w - tw) * 0.5 or (w - tw)
+            pcall(imgui.SetCursorPosX, cx + pad)
+        end
+    end
+    imgui.TextColored(EXP_COLOR, label)
+end
 
 -- ========= Draw =========
 ashita.events.register('d3d_present', 'present_cb', function ()
@@ -3640,6 +3934,10 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         pcall(save_history)
     end
 
+    -- Load this character's notes (once, and again on a relog to a different character) and save
+    -- them on a debounce. Runs before the event-hide return so notes persist even during cutscenes.
+    pcall(chat.notes_sync)
+
     -- One-time auto-check, the first frame this handler runs past the login gate above (i.e.
     -- once, right after the character is confirmed loaded into the world -- same trigger this
     -- gate already exists for). https.request is a blocking call, so this causes one brief
@@ -3671,6 +3969,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- Isolated so a fault in the settings window can't abort the frame before the popped/main
     -- windows below it get drawn (they're rendered later in this same handler).
     pcall(sv.draw_window)
+    pcall(chat.notes_draw)
 
     -- Popped-out windows
     for channel, state in pairs(pop) do
@@ -3678,8 +3977,8 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             local title = 'MultiChat - ' .. (channelLabels[channel] or channel) .. chat.title_suffix(channel)
             apply_window_bounds(channel)
             local pushed_titlebar = push_titlebar_color()
-            imgui.PushStyleColor(ImGuiCol_WindowBg, {0.10, 0.10, 0.10, cfg.chat_bg_alpha or 0.25})
-            if imgui.Begin(title, state.is_open) then
+            imgui.PushStyleColor(ImGuiCol_WindowBg, chat.window_bg(channel))
+            if imgui.Begin(title, state.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse) then
                 apply_font_scale()
                 save_window_geom(channel)
                 -- ImGuiFocusedFlags_ChildWindows is required here -- the message area below is
@@ -3690,17 +3989,14 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 -- clear the alert, only clicking near the buttons did.
                 local focused = false; pcall(function() focused = imgui.IsWindowFocused(ImGuiFocusedFlags_ChildWindows) end)
                 if focused then pop[channel].alert = false end
-                if titlebar_color_button('Pop In') then state.popped=false; state.is_open[1]=true; pop[channel].alert=false end
-                -- Plain ASCII, not the "proper" bullet character -- same font-glyph-coverage
-                -- issue as the special chat characters (see fix_special_chars): "•" renders as
-                -- "?" since it's outside the loaded JP font's glyph range. Confirmed via
-                -- in-game screenshot.
-                imgui.SameLine(); if is_alerting(channel) then imgui.TextColored({1,0.4,0.4,1}, '!') end
-                imgui.SameLine(); if titlebar_color_button('Copy') then copy_all(channel) end
+                -- A popped-out window is just its title bar and the log. Pop-in now lives on the
+                -- main window's Pop In button and the tab right-click menu; copying lives on the row
+                -- right-click menu ("Copy line" / "Copy log"). Combat keeps its "Last EXP" readout as
+                -- the one exception, on its own line above the log.
                 if channel == 'combat' then
-                    imgui.SameLine(); imgui.TextColored(EXP_COLOR, 'Last EXP: ' .. (last_exp_gained and tostring(last_exp_gained) or '-'))
+                    chat.draw_last_exp()
+                    imgui.Separator()
                 end
-                imgui.Separator()
                 -- Window background already carries the tint; keep the child transparent so it
                 -- doesn't double up (two stacked semi-transparent layers would look more opaque
                 -- than the rest of the window).
@@ -3725,12 +4021,12 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     if (chat.is_open[1]) then
         apply_window_bounds('main')
         local pushed_titlebar_main = push_titlebar_color()
-        imgui.PushStyleColor(ImGuiCol_WindowBg, {0.10, 0.10, 0.10, cfg.chat_bg_alpha or 0.25})
+        imgui.PushStyleColor(ImGuiCol_WindowBg, chat.window_bg('main'))
         -- "###MultiChatMain" keeps the window's actual ImGui ID stable while the visible title
         -- text changes with the active channel -- without it, changing the title string would
         -- make ImGui treat this as a brand-new window each time (losing position/size/focus).
         local main_title = 'MultiChat - ' .. (channelLabels[chat.active_channel] or chat.active_channel) .. chat.title_suffix(chat.active_channel) .. '###MultiChatMain'
-        if (imgui.Begin(main_title, chat.is_open)) then
+        if (imgui.Begin(main_title, chat.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse)) then
             apply_font_scale()
             save_window_geom('main')
 
@@ -3851,7 +4147,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             imgui.SameLine()
             draw_split_toggle_button()
             imgui.SameLine()
-            if titlebar_color_button('Copy') then copy_all(active) end
+            if titlebar_color_button('Notes') then chat.notes.is_open[1] = not chat.notes.is_open[1] end
             imgui.SameLine()
             if borderless_button(ICON_GEAR) then settings_ui.is_open[1] = true end
 
@@ -3921,10 +4217,6 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 						-- mini header (title + copy + close view)
 						imgui.TextColored(channelColors[rch] or {1,1,1,1}, channelLabels[rch] or rch)
 						imgui.SameLine()
-						if titlebar_color_button('Copy##right') then
-							copy_all(rch)
-						end
-						imgui.SameLine()
 						if titlebar_color_button('Close View##right') then
 							split.enabled = false
 						end
@@ -3984,10 +4276,6 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 						apply_font_scale()
 						-- mini header (title + copy + close view)
 						imgui.TextColored(channelColors[rch] or {1,1,1,1}, channelLabels[rch] or rch)
-						imgui.SameLine()
-						if titlebar_color_button('Copy##right') then
-							copy_all(rch)
-						end
 						imgui.SameLine()
 						if titlebar_color_button('Close View##right') then
 							split.enabled = false

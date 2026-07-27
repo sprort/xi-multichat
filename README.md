@@ -34,6 +34,7 @@ Built and tested on HorizonXI; should work on any Ashita v4 server.
 - 5000 lines per channel, duplicate suppression, settings persist across sessions
 - Optional history restore across reloads/relogs, and optional per-tab plain-text logs (see below)
 - A red divider marks each session break (logout/login or addon reload), separating the previous session from the current one
+- A **notes scratch pad** (`/multichat notes` or the Notes button) — a free-form text window saved per character that persists across reloads and relogs
 - Stays hidden until you're logged in — safe to auto-load from `default.txt`
 
 **Settings** (⚙): transparency, font size, line spacing, timestamp format, per-channel or global colors, and hiding all windows during cutscenes/events.
@@ -47,6 +48,7 @@ Craft/Combat and Shout/Yell filters apply retroactively to messages already capt
 | `/multichat` | Toggle the window |
 | `/multichat show` | Open and re-center |
 | `/multichat reset` | Reset all window positions |
+| `/multichat notes` | Toggle the notes scratch pad |
 | `/multichat reload` | Reload the addon |
 | `/multichat checkupdate` | Check for a newer version |
 | `/multichat update` | Install the latest version and reload |
