@@ -223,6 +223,9 @@ local default_config = {
     -- second deliberate step; nothing is logged until you pick tabs. Normalized in apply_cfg_defaults.
     log_channels     = { linkshell=false, linkshell2=false, party=false, tell=false, say=false,
                          shout=false, craft=false, combat=false, quest=false, sys=false },
+    -- Log culling: keep only the most recent N days (date-folders) of logs per character, deleting
+    -- older ones at login so the logs folder can't grow without bound. 0 = keep everything forever.
+    log_retention_days = 30,
     -- Automatic pop-out: when a trigger condition starts, pop that tab out into its own window;
     -- when the condition ends, pop it back in -- but only if auto-pop was what opened it, so it
     -- never overrides windows you popped yourself. Whole feature gated behind `enabled`.
@@ -279,6 +282,9 @@ local function apply_cfg_defaults(c)
     if c.shoutyell_filter ~= 'shout' and c.shoutyell_filter ~= 'yell' then c.shoutyell_filter = 'both' end
     if c.persist_history == nil then c.persist_history = true end
     if c.enable_logging == nil then c.enable_logging = false end
+    if type(c.log_retention_days) ~= 'number' then c.log_retention_days = 30 end
+    c.log_retention_days = math.floor(c.log_retention_days + 0.5)   -- whole days
+    if c.log_retention_days < 0 then c.log_retention_days = 0 elseif c.log_retention_days > 3650 then c.log_retention_days = 3650 end
     if c.hide_during_events == nil then c.hide_during_events = false end
     if c.autohide_ls2 == nil then c.autohide_ls2 = true end
     if type(c.ls_names) ~= 'table' then c.ls_names = {} end
@@ -959,6 +965,37 @@ local function log_file_path(channel)
     return string.format('%s\\%s.txt', log_session_dir(), (LOG_CHANNEL_NAME[channel] or channel))
 end
 
+-- Log culling: keep only the newest cfg.log_retention_days date-folders under this character's log
+-- directory, deleting the rest. Runs once at session start (login) and never touches today's folder
+-- (with retention >= 1, today is always among the newest kept, plus an explicit guard). 0 = keep
+-- everything forever. Fully pcall-guarded and off the render path: a single directory listing plus
+-- at most a few rmdir calls. Only date-named (YYYY-MM-DD) folders are ever considered for deletion.
+function chat.prune_old_logs()
+    if not cfg.enable_logging then return end                     -- only manage logs while logging is on
+    local keep = cfg.log_retention_days or 0
+    if keep <= 0 then return end                                  -- keep forever
+    local char = (log_session_char or ''):gsub('[^%w]', '')
+    if char == '' then return end
+    local dir = string.format('%s\\logs\\%s', config_base_dir(), char)
+    local p = io.popen(string.format('dir /b /ad "%s" 2>nul', dir))
+    if not p then return end
+    local dates = {}
+    for line in p:lines() do
+        local d = line:match('^(%d%d%d%d%-%d%d%-%d%d)%s*$')       -- only real date folders
+        if d then dates[#dates + 1] = d end
+    end
+    p:close()
+    if #dates <= keep then return end
+    table.sort(dates)                                             -- ascending -> oldest first
+    local today = os.date('%Y-%m-%d')
+    for i = 1, #dates - keep do
+        local d = dates[i]
+        if d ~= today then                                        -- never the folder we write to now
+            pcall(function() os.execute(string.format('rmdir /s /q "%s\\%s" 2>nul', dir, d)) end)
+        end
+    end
+end
+
 -- Writes this session's divider to a tab's file (once per session per tab), creating the file (and
 -- the day's folder) if needed. Marking the session up front here is what gives every selected tab a
 -- file the moment you log in -- even one that never receives a line -- and cleanly separates
@@ -1046,6 +1083,7 @@ local function manage_log_session(logged_in, real_logout)
             log_session_time = os.date('%H:%M:%S')
             log_dir_made = false
             log_headed = {}    -- new session -> write a fresh divider into each tab's file
+            pcall(chat.prune_old_logs)   -- once per login: trim this character's logs to the retention window
         end
     end
 end
@@ -3289,6 +3327,15 @@ function sv.draw_history()
             imgui.Spacing()
             imgui.TextColored({1.0, 0.72, 0.35, 1.0}, 'No tabs selected -- nothing is being logged yet.')
         end
+
+        imgui.Spacing(); imgui.Spacing()
+        imgui.Text('Keep logs for:')
+        local rd = { cfg.log_retention_days or 30 }
+        imgui.SetNextItemWidth(220)
+        if imgui.SliderInt('##log_retention', rd, 0, 180, (rd[1] <= 0) and 'Keep forever' or '%d days') then
+            cfg.log_retention_days = rd[1]
+        end
+        imgui.TextWrapped('At login, any days older than this are deleted so the logs folder stays bounded (one folder per day per character). Set to 0 to keep everything forever.')
     end
 end
 

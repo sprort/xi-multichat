@@ -78,6 +78,7 @@ Both are controlled from the **History & Logging** section of Settings (⚙), an
 - **Write chat logs to disk** (off by default) — saves each selected tab to **one file per day**: `logs/<character>/<date>/<Tab>.txt`. Logging in again the same day appends to the same files under a `===== login <date> <time> =====` divider, so a day's folder stays tidy (one file per tab) instead of growing with every login. Zoning does **not** start a new session. Lines are written as `[HH:MM:SS] Name: message`.
   - **Log these tabs** — pick exactly which tabs to log (all on by default). Turn off the ones you don't care about; the rest still log.
   - Each selected tab's file gets its divider written **as soon as you log in**, so the file exists for the session even if that tab never receives a line.
+  - **Keep logs for N days** (default 30) — at login, day-folders older than the most recent N are deleted for that character, so the folder can't grow without bound. Set it to **0** to keep everything forever. Only the current character's logs are pruned (each alt is tidied when you play it), and today's folder is never touched.
 
 ## Japanese text shows as `?`
 
