@@ -1240,54 +1240,9 @@ ashita.events.register('command', 'multichat_command_cb', function (e)
         return
     end
 
-    -- Mirror outgoing /say (/s ...). These are your OWN messages, so they never raise a tab alert
-    -- (no_alert=true) -- you don't need to be flagged about text you just typed.
-    local say_msg = lower:match('^/s%s+(.+)$') or lower:match('^/say%s+(.+)$')
-    if say_msg then
-        local me = current_char_name()
-        local orig = cmdline:gsub('^/%a+%s+', '', 1)
-        orig = clean_str(orig)
-        append_message('say', me ~= '' and me or 'Me', orig, false, nil, nil, nil, true)
-        return
-    end
-
-    -- Mirror outgoing /shout and /yell. Incoming shouts/yells are captured via text_in (modes
-    -- 10/11), but your OWN outgoing ones don't arrive that way -- same reason /say and /tell are
-    -- mirrored from the command here rather than relied on from the packet/text stream.
-    -- Confirmed via user report: a self-yell showed in the native log but not in the Sh/Y tab.
-    -- `kind` ('shout'/'yell') is set so the Both/Shout/Yell filter treats these like any other.
-    local shout_msg = lower:match('^/shout%s+(.+)$') or lower:match('^/sh%s+(.+)$')
-    if shout_msg then
-        local me = current_char_name()
-        local orig = clean_str(cmdline:gsub('^/%a+%s+', '', 1))
-        append_message('shout', me ~= '' and me or 'Me', orig, false, SHOUT_TEXT_COLOR, nil, nil, true, 'shout')
-        return
-    end
-    local yell_msg = lower:match('^/yell%s+(.+)$') or lower:match('^/y%s+(.+)$')
-    if yell_msg then
-        local me = current_char_name()
-        local orig = clean_str(cmdline:gsub('^/%a+%s+', '', 1))
-        append_message('shout', me ~= '' and me or 'Me', orig, false, YELL_TEXT_COLOR, nil, nil, true, 'yell')
-        return
-    end
-
-    -- Mirror outgoing /tell (/t Name message or /tell Name message). The recipient is shown in
-    -- the username itself (">>Abbynightwish") rather than a separate column or a per-message
-    -- prefix, reusing FFXI's own native ">>Name :" convention for outgoing tells exactly as-is
-    -- (no redundant "Sprort" prefix -- an outgoing tell already implies it's from you, the same
-    -- way the native log doesn't repeat your own name either) -- confirmed via user report that
-    -- scrolling back through Tell history otherwise gives no way to tell who an outgoing
-    -- message actually went to, without adding much column width doing it.
-    local target, tmsg = cmdline:match('^/[Tt]ell%s+(%S+)%s+(.+)$')
-    if not target then target, tmsg = cmdline:match('^/t%s+(%S+)%s+(.+)$') end
-    if target and tmsg then
-        tmsg = clean_str(tmsg)
-        -- no_alert=true: Tell is an always-alert channel, but an outgoing tell is something you
-        -- just typed, so it shouldn't flash the tab -- only incoming tells should. (Same treatment
-        -- as own outgoing say/shout/yell.)
-        append_message('tell', '>>' .. target, tmsg, false, nil, nil, nil, true)
-        return
-    end
+    -- Outgoing say/shout/yell/tell/party/LS are captured from the send packet (0x0B5 / 0x0B6, see
+    -- the packet_out handler below), not mirrored from the typed command -- the packet carries the
+    -- client's fully token-substituted text (<job>, <t>, etc.), which the raw command line does not.
 end)
 
 -- Field offsets are dictated by packet 0x017's on-the-wire layout, not a style choice --
@@ -1328,34 +1283,54 @@ ashita.events.register('packet_in', 'packet_in_cb', function (e)
     end)
 end)
 
--- ===== Outgoing packets (best effort – command mirror ensures /say & /tell) =====
-local function parse_outgoing_chat(e)
-    local layouts = { {0x04,0x06}, {0x0A,0x0E}, {0x0E,0x12} }
-    local bufs = { e.data_modified, e.data }
-    for _,buf in ipairs(bufs) do
-        for _,L in ipairs(layouts) do
-            local okm, mode = pcall(struct.unpack, 'B', buf, L[1] + 1)
-            local okt, text = pcall(struct.unpack, 's', buf, L[2] + 1)
-            if okm and okt and mode and text and text ~= '' then
-                local ch = msgtype_to_channel(mode)
-                if ch then return ch, text end
-            end
-        end
-    end
-    return nil, nil
-end
+-- ===== Outgoing packets =====
+-- Your own outgoing chat is read straight from the send packet, which the client has ALREADY
+-- token-substituted (<job>, <t>, <hp>, party/alliance slots, auto-translate, etc.) -- so the tab
+-- shows exactly what everyone else received, not the raw "<job>" you typed. 0x0B5 carries say/shout/
+-- yell/party/LS (mode byte at 0x04, null-terminated text at 0x06); tells go out as a separate 0x0B6
+-- (mode 3, a 15-byte recipient name at 0x06, then text at 0x15). These are your OWN messages, so
+-- they never raise a tab alert (no_alert). The send-side mode enum differs from incoming 0x017's, so
+-- it gets its own table. Shout and yell share the Sh/Y tab, told apart by `kind` (for the filter) and
+-- colored like their incoming counterparts. % is doubled because rows are drawn through imgui's
+-- printf-style TextColored, so a literal % must be escaped to render.
+local OUTGOING_0B5 = {
+    [0]  = { ch = 'say'        },
+    [1]  = { ch = 'shout',      color = SHOUT_TEXT_COLOR, kind = 'shout' },
+    [4]  = { ch = 'party'      },
+    [5]  = { ch = 'linkshell'  },
+    [26] = { ch = 'shout',      color = YELL_TEXT_COLOR,  kind = 'yell'  },
+    [27] = { ch = 'linkshell2' },
+}
 
 ashita.events.register('packet_out', 'outgoing_packet', function (e)
-    if (e.id == 0x0B5) then
-        local ch, msg = parse_outgoing_chat(e)
-        -- Say/Tell are already mirrored reliably via the command hook above;
-        -- this path only needs to cover channels that hook doesn't (LS1/LS2/Party).
-        if ch and msg and ch ~= 'say' and ch ~= 'tell' then
-            msg = string.gsub(msg, "%%", "%%%%")
-            msg = clean_str(msg)
+    if e.id == 0x0B5 then
+        pcall(function()
+            local mode = struct.unpack('B', e.data, 0x04 + 1)
+            local spec = mode and OUTGOING_0B5[mode]
+            if not spec then return end
+            local text = struct.unpack('s', e.data, 0x06 + 1)
+            if not text or text == '' then return end
+            text = text:gsub('%%', '%%%%')
+            text = clean_str(text)
+            if text == '' then return end
             local me = current_char_name()
-            append_message(ch, me ~= '' and me or 'Me', msg, false)
-        end
+            append_message(spec.ch, (me ~= '' and me) or 'Me', text, false, spec.color, nil, nil, true, spec.kind)
+        end)
+    elseif e.id == 0x0B6 then
+        pcall(function()
+            local mode = struct.unpack('B', e.data, 0x04 + 1)
+            if mode ~= 3 then return end
+            local name = struct.unpack('c15', e.data, 0x06 + 1)
+            local text = struct.unpack('s', e.data, 0x15 + 1)
+            if not text or text == '' then return end
+            name = (name or ''):trimend('\x00')
+            text = text:gsub('%%', '%%%%')
+            text = clean_str(text)
+            if text == '' then return end
+            -- Outgoing tells show the recipient in the username as ">>Name" (the leading arrow points
+            -- away from you), mirroring FFXI's own native convention -- see the incoming ">>"/"Name>>".
+            append_message('tell', '>>' .. name, text, false, nil, nil, nil, true)
+        end)
     end
 end)
 
