@@ -14,6 +14,7 @@ Built and tested on HorizonXI; should work on any Ashita v4 server.
 
 **Channels**
 
+- **LS1 / LS2** — your two linkshells. Each tab's title shows the linkshell's name (`MultiChat - LS1 - <name>`), and the `/lsmes` message of the day appears in the tab on login or when you equip a linkshell. LS2 stays hidden unless you're actually in a second linkshell
 - **Shout/Yell** — combined tab, each colored differently, with a Both/Shout/Yell filter
 - **Craft** — synthesis results, fishing, and skill-ups
 - **Combat** — hits, misses, crits, abilities, casting, status effects, recovery, defeats, drops, experience, level changes
