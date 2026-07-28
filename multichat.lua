@@ -1003,11 +1003,20 @@ local function restore_history()
                 if type(e) == 'table' and e.is_break then
                     buf:push({ epoch = e.epoch or os.time(), is_break = true, reason = e.reason, who = e.who })   -- past session divider
                 elseif type(e) == 'table' and type(e.message) == 'string' then
-                    buf:push({
-                        epoch = e.epoch or os.time(), username = e.username or '', message = e.message,
-                        text_color = e.text_color, uname_color = e.uname_color,
-                        spans = e.spans, kind = e.kind, mention = e.mention,
-                    })
+                    -- Skip rows that were captured malformed before the fixes went in, so they clear on
+                    -- reload instead of lingering: the hardcore-death broadcast that got split into a
+                    -- bogus username, and the "_CUSTOM_MENU" teleporter-menu tells. Matched on the
+                    -- username (plain find) -- the correctly-formatted hardcore row uses "Hardcore".
+                    local uname = e.username or ''
+                    local drop = uname:find('has fallen as a hardcore adventurer', 1, true)
+                              or uname:find('_CUSTOM_MENU', 1, true)
+                    if not drop then
+                        buf:push({
+                            epoch = e.epoch or os.time(), username = uname, message = e.message,
+                            text_color = e.text_color, uname_color = e.uname_color,
+                            spans = e.spans, kind = e.kind, mention = e.mention,
+                        })
+                    end
                 end
             end
         end
@@ -2375,6 +2384,17 @@ local function try_broadcast_message(msg)
     end
 
     if msg:match("^★ .- has reached level %d+ on .- as a hardcore character! ★$") then
+        for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
+            append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR, nil, ch ~= 'sys')
+        end
+        return true
+    end
+
+    -- The other hardcore broadcast: a hardcore character's death, e.g. "Kanami has fallen as a
+    -- hardcore adventurer. While playing as: 69SMN with a playtime of: 574 hours." Matched on its
+    -- full shape (name + job + playtime) so an ordinary shout can't trip it. Without this it fell
+    -- through to normal routing and got split at the first colon into a bogus username + message.
+    if msg:match("^.- has fallen as a hardcore adventurer%. While playing as: .- with a playtime of: %d+ hours?%.$") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
             append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR, nil, ch ~= 'sys')
         end
@@ -3793,10 +3813,17 @@ function chat.autoscroll(key)
     if not lineH or lineH <= 0 then lineH = 18 end
     local wheel = 0; pcall(function() wheel = imgui.GetIO().MouseWheel end)
     local hovered = false; pcall(function() hovered = imgui.IsWindowHovered() end)
+    -- Unpin on any scroll-up (wheel up, or a scrollbar drag that moves more than a few lines above
+    -- the bottom). Re-pin ONLY on an active downward scroll while already at the bottom -- NOT on a
+    -- passive "y is near the bottom" check. With variable-height wrapped rows, the virtualized
+    -- content height (hence scrollMaxY) wobbles by a line or so; a position-based re-pin read that
+    -- wobble as "at the bottom" and yanked the view down every other frame -- the flashing/jumping
+    -- when you scrolled up a single line. Requiring a real wheel-down at the bottom can't be fooled.
     if (hovered and wheel and wheel > 0) or (y < my - lineH * 3) then
-        st[key] = false                      -- user scrolled up -> stop pinning
+        st[key] = false
+    elseif hovered and wheel and wheel < 0 and y >= my - lineH then
+        st[key] = true
     end
-    if y >= my - 2 then st[key] = true end   -- returned to the bottom -> resume pinning
     if st[key] then pcall(function() imgui.SetScrollHereY(1.0) end) end
 end
 
@@ -4001,7 +4028,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 -- doesn't double up (two stacked semi-transparent layers would look more opaque
                 -- than the rest of the window).
                 imgui.PushStyleColor(ImGuiCol_ChildBg, {0,0,0,0})
-                if imgui.BeginChild(title .. 'Messages', {0, -imgui.GetFrameHeightWithSpacing() + 20}) then
+                if imgui.BeginChild(title .. 'Messages', {0, -imgui.GetFrameHeightWithSpacing() + 20}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0)) then
                     apply_font_scale()
                     draw_channel_messages(channel)
                     -- A few pixels of trailing space so descenders (y, g, p, q) on the last line
@@ -4185,7 +4212,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     local bottomh = math.max(minh, availy - toph - grip)
 
                     -- TOP PANE (active)
-                    imgui.BeginChild('MessagesTop', {availx, toph})
+                    imgui.BeginChild('MessagesTop', {availx, toph}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
                         apply_font_scale()
                         draw_channel_messages(active)
@@ -4211,7 +4238,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
                     -- BOTTOM PANE (split.right_channel)
                     local rch = split.right_channel
-                    imgui.BeginChild('MessagesBottom', {availx, bottomh})
+                    imgui.BeginChild('MessagesBottom', {availx, bottomh}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
 						apply_font_scale()
 						-- mini header (title + copy + close view)
@@ -4242,7 +4269,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     local rightw = math.max(minw, availx - leftw - grip)
 
                     -- LEFT PANE (active)
-                    imgui.BeginChild('MessagesLeft', {leftw, availy})
+                    imgui.BeginChild('MessagesLeft', {leftw, availy}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
                         apply_font_scale()
                         draw_channel_messages(active)
@@ -4271,7 +4298,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
                     -- RIGHT PANE (split.right_channel)
                     local rch = split.right_channel
-                    imgui.BeginChild('MessagesRight', {rightw, availy})
+                    imgui.BeginChild('MessagesRight', {rightw, availy}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
 						apply_font_scale()
 						-- mini header (title + copy + close view)
@@ -4293,7 +4320,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     pop[rch].alert = false
                 else
                     -- Single-pane layout
-                    if (imgui.BeginChild('MessagesWindow', {0, -imgui.GetFrameHeightWithSpacing() + 20})) then
+                    if (imgui.BeginChild('MessagesWindow', {0, -imgui.GetFrameHeightWithSpacing() + 20}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))) then
                         apply_font_scale()
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
