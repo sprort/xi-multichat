@@ -2027,7 +2027,12 @@ local function try_party_emote(line)
         qualifies = is_genuine_party_member(target)
     end
 
-    append_message(qualifies and 'party' or 'say', actor, line, true)
+    -- Emotes get a purple hue on the message TEXT only, so they stand out from ordinary chat in
+    -- whichever tab they land in -- the username keeps its normal (per-channel) color. Local table
+    -- (not a top-level const) to stay under the per-chunk local cap; emotes are infrequent, so the
+    -- per-call allocation is negligible.
+    local emote_color = {195/255, 130/255, 235/255, 1.0}
+    append_message(qualifies and 'party' or 'say', actor, line, true, emote_color)
     return true
 end
 
@@ -3629,7 +3634,7 @@ function sv.draw_autopop()
         imgui.Text('Pop out when:')
         imgui.Indent(12)
         local c = { a.combat }
-        if imgui.Checkbox('You enter combat  -> Combat', c) then a.combat = c[1] end
+        if imgui.Checkbox('You or your party enters combat  -> Combat', c) then a.combat = c[1] end
         local cr = { a.craft }
         if imgui.Checkbox('You craft or fish  -> Craft', cr) then a.craft = cr[1] end
         local p = { a.party }
@@ -3768,11 +3773,24 @@ function autopop.eval()
     if not cfg.autopop.enabled then return end
 
     if cfg.autopop.combat then
+        -- Consider the party "in combat" if YOU or ANY active party member is engaged (status 1).
+        -- Keying only off your own engaged status missed casters/support -- who fight without ever
+        -- meleeing -- so the Combat window never popped in a party. Checking every member covers
+        -- that: when the tank/DD engages, your Combat window opens too.
         local engaged = false
         pcall(function()
             local mm = AshitaCore:GetMemoryManager()
-            local pidx = mm:GetParty():GetMemberTargetIndex(0)
-            engaged = (mm:GetEntity():GetStatus(pidx) == 1)   -- 1 = Engaged
+            local party = mm:GetParty()
+            local ent = mm:GetEntity()
+            for i = 0, 5 do
+                if party:GetMemberIsActive(i) == 1 then
+                    local idx = party:GetMemberTargetIndex(i)
+                    if idx and idx > 0 and ent:GetStatus(idx) == 1 then   -- 1 = Engaged
+                        engaged = true
+                        break
+                    end
+                end
+            end
         end)
         autopop.apply('combat', engaged, cfg.autopop.close_delay)
     end
