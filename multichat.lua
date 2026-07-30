@@ -3061,9 +3061,30 @@ local function draw_channel_messages(channel)
     local ts_sig = (cfg.timestamp_12h and '12' or '24') .. (cfg.timestamp_format or 'hms')
 
     -- Pass 1 (arithmetic only): sum heights to find the visible slice + the spacer heights.
+    -- Row height is derived from the ACTUAL wrapped line count, not a flat one-line guess. The wrap
+    -- is cached on the row and keyed by width + text -- and this width (msg_col_x offset from the
+    -- content edge) is exactly the one draw_wrapped_colored uses, so Pass 2 reuses this same cache
+    -- with no extra work. Using the true height for every row (on-screen or not) keeps the reserved
+    -- spacers and scrollMaxY stable frame to frame, so a wrapped row scrolling into view no longer
+    -- "corrects" from one line to several and shoves the whole view -- the bounce/flicker when you
+    -- nudge the wheel up a single line. Applies to every tab/window since they all draw through here.
+    local msg_wrap_w = availx - msg_col_x
     local function row_h(entry)
-        if entry._row_h and entry._row_h_w == availx and entry._row_h > 0 then return entry._row_h end
-        return lineH
+        if entry.is_break then return lineH + 8 end          -- a divider: Spacing + text + Spacing
+        if msg_wrap_w <= 20 then return lineH end
+        local lines
+        if entry._wrap_w == msg_wrap_w and entry._wrap_text == entry.message then
+            lines = entry._wrap_lines
+        else
+            local tokens = tokenize_for_wrap(entry.message, entry.spans)
+            lines = layout_tokens(tokens, msg_wrap_w)
+            entry._wrap_w = msg_wrap_w
+            entry._wrap_text = entry.message
+            entry._wrap_lines = lines
+        end
+        local nlines = #lines
+        if nlines < 1 then nlines = 1 end
+        return nlines * lineH
     end
     local topSpacer, botSpacer = 0, 0
     local firstVis, lastVis
