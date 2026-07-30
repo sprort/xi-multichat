@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.0';
+addon.version   = '2.0.1';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -214,6 +214,7 @@ local default_config = {
     autohide_ls2 = true,        -- hide the LS2 tab unless you're actually in a second linkshell
     show_collapse_arrow = false,-- show the title-bar collapse triangle on chat windows (off = cleaner title bar)
     notes_show_collapse_arrow = false, -- same, but for the notes window only (independent of the above)
+    show_battery = false,       -- show the host machine's battery % in the main window's title bar
     -- Accent colors for the window chrome (RGBA 0..1). Each is user-customizable with its own alpha,
     -- so e.g. the title bar can be made translucent. Defaults reproduce the original blue theme; the
     -- inactive/hover shades are derived from these at draw time. See push_titlebar_color / push_accent_colors.
@@ -319,6 +320,7 @@ local function apply_cfg_defaults(c)
     if c.autohide_ls2 == nil then c.autohide_ls2 = true end
     if c.show_collapse_arrow == nil then c.show_collapse_arrow = false end
     if c.notes_show_collapse_arrow == nil then c.notes_show_collapse_arrow = false end
+    if c.show_battery == nil then c.show_battery = false end
 
     -- Accent colors: guarantee a valid {r,g,b,a} (each 0..1) for each chrome element.
     c.accent = (type(c.accent) == 'table') and c.accent or {}
@@ -1289,6 +1291,116 @@ end
 -- outgoing shout/yell, can reference them -- a later `local` wouldn't be in scope for it.
 local SHOUT_TEXT_COLOR = {255/255, 170/255,  60/255, 1.0} -- orange: Shout
 local YELL_TEXT_COLOR  = {255/255,  90/255, 200/255, 1.0} -- pink/magenta: Yell
+
+-- ===== Battery info (host machine battery %, shown in the main window's title bar) =====
+-- Ported from the batteryinfo addon (github.com/sprort/xi-batteryinfo): reads the host's battery
+-- state straight from the Windows API (GetSystemPowerStatus) via FFI -- no game data involved, no
+-- external files. Off by default (cfg.show_battery). ffi/cdef hung on `chat` to avoid top-level
+-- locals near Lua's 200-per-chunk cap; wrapped in pcall so a missing FFI just disables the feature.
+do
+    local ok, f = pcall(require, 'ffi')
+    if ok and f then
+        chat._ffi = f
+        pcall(function() f.cdef[[
+            typedef struct _MC_SPS {
+                unsigned char  ACLineStatus;
+                unsigned char  BatteryFlag;
+                unsigned char  BatteryLifePercent;
+                unsigned char  Reserved1;
+                unsigned long  BatteryLifeTime;
+                unsigned long  BatteryFullLifeTime;
+            } MC_SPS;
+            int GetSystemPowerStatus(MC_SPS* lpSystemPowerStatus);
+        ]] end)
+    end
+end
+chat.battery = { last_poll = 0, unknown = true, percent = 0, charging = false, plugged = false }
+if chat._ffi then pcall(function() chat.battery.sps = chat._ffi.new('MC_SPS') end) end
+
+function chat.battery_poll()
+    local f = chat._ffi
+    if not (f and chat.battery.sps) then chat.battery.unknown = true; return end
+    local okc = pcall(function()
+        local ret = f.C.GetSystemPowerStatus(chat.battery.sps)
+        local s = chat.battery.sps
+        -- 0xFF = unknown; BatteryFlag 0x80 = no system battery (desktop).
+        if ret == 0 or s.BatteryFlag == 0xFF or s.BatteryLifePercent == 0xFF or s.BatteryFlag == 0x80 then
+            chat.battery.unknown = true
+        else
+            chat.battery.unknown  = false
+            chat.battery.percent  = tonumber(s.BatteryLifePercent)
+            chat.battery.plugged  = (s.ACLineStatus == 1)
+            chat.battery.charging = chat.battery.plugged and (bit.band(tonumber(s.BatteryFlag), 0x08) ~= 0)
+        end
+    end)
+    if not okc then chat.battery.unknown = true end
+end
+
+-- Returns the label text and its {r,g,b,a} color for the current battery state. Colors mirror the
+-- batteryinfo addon: green charging, orange <=20% (draining), flashing red <=10% (draining), gray N/A.
+function chat.battery_label()
+    local b = chat.battery
+    if b.unknown then return 'Battery: N/A', {0.67, 0.67, 0.67, 1.0} end
+    local text = string.format('Battery: %d%%', b.percent)
+    if (not b.plugged) and b.percent <= 10 then
+        local flash_on = (math.floor(os.clock() / 0.5) % 2) == 0
+        return text, flash_on and {1, 1, 1, 1} or {1.0, 0.13, 0.13, 1.0}
+    elseif b.charging then
+        return text, {0.25, 1.0, 0.25, 1.0}
+    elseif (not b.plugged) and b.percent <= 20 then
+        return text, {1.0, 0.65, 0.0, 1.0}
+    end
+    return text, {1, 1, 1, 1}
+end
+
+-- Draws the battery label right-aligned in the current window's title bar, left of the close button.
+-- Uses the foreground draw list (unclipped) since the window draw list is clipped to the content
+-- area and wouldn't reach the title bar. Just text, no background. Call right after imgui.Begin.
+function chat.battery_draw_titlebar()
+    if not cfg.show_battery then return end
+    local text, color = chat.battery_label()
+    if not text then return end
+    -- GetWindowPos/GetWindowSize return TWO numbers (x, y) in this binding, not a single ImVec2 --
+    -- capture both. (Taking one value gave the x and left y at 0, which drew the label at the top of
+    -- the screen instead of on the window's title bar.)
+    local px, py, w
+    do
+        local ok, a, b = pcall(imgui.GetWindowPos)
+        if not ok then return end
+        if type(a) == 'number' then px = a; py = (type(b) == 'number' and b or 0)
+        elseif a ~= nil then px = get_x(a); py = get_y(a) else return end
+    end
+    do
+        local ok, a = pcall(imgui.GetWindowSize)
+        if not ok then return end
+        w = (type(a) == 'number') and a or (a ~= nil and get_x(a) or nil)
+        if not w then return end
+    end
+    local titleH = 20; do local ok, th = pcall(imgui.GetFrameHeight); if ok and type(th) == 'number' then titleH = th end end
+    local tw, fh = #text * 7, 14
+    do local ok, sw, sh = pcall(imgui.CalcTextSize, text)
+        if ok then
+            if type(sw) == 'number' then tw = sw; if type(sh) == 'number' then fh = sh end
+            elseif sw ~= nil then tw = get_x(sw); fh = get_y(sw) end
+        end
+    end
+    local tx = px + w - (titleH + 8) - tw   -- (titleH + 8) leaves room for the [X] close button
+    local ty = py + (titleH - fh) * 0.5
+    local dl = imgui.GetForegroundDrawList()
+    if not dl then return end
+    local u = imgui.GetColorU32(color)
+    -- Draw at the window's current font + size (AddText's 5-arg form) so the label matches the title
+    -- bar's scaled font and lines up with tw (measured with CalcTextSize at that same size), rather
+    -- than the tiny default draw-list font. Falls back to the 3-arg form if GetFont isn't available.
+    local font, fsize
+    pcall(function() font = imgui.GetFont() end)
+    pcall(function() fsize = imgui.GetFontSize() end)
+    if font and type(fsize) == 'number' and fsize > 0 then
+        pcall(function() dl:AddText(font, fsize, {tx, ty}, u, text) end)
+    else
+        pcall(function() dl:AddText({tx, ty}, u, text) end)
+    end
+end
 
 -- ===== Notes (persistent scratch pad) =====
 -- A single free-form text buffer per character, saved to config/addons/multichat/notes/<char>.txt
@@ -3488,6 +3600,11 @@ function sv.draw_general()
         if imgui.Checkbox('Show the title-bar collapse arrow', sca) then cfg.show_collapse_arrow = sca[1] end
         imgui.TextWrapped('The triangle at the left of each window\'s title bar that collapses it. Off (default) keeps the title bar -- with the addon name, tab, and linkshell name -- but removes the arrow and double-click-to-collapse for a cleaner look.')
 
+        imgui.Spacing()
+        local sb = { cfg.show_battery }
+        if imgui.Checkbox('Show host battery % in the main title bar', sb) then cfg.show_battery = sb[1] end
+        imgui.TextWrapped('Shows your machine\'s battery level (right-aligned in the main window\'s title bar) -- green while charging, orange under 20%, flashing red under 10%. Reads the host battery directly; no game data involved. Handy on a laptop.')
+
     else
         imgui.Text('Format:')
         if imgui.RadioButton('HH:MM:SS', cfg.timestamp_format == 'hms') then cfg.timestamp_format = 'hms' end
@@ -3975,6 +4092,12 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         pcall(flush_logs)
     end
 
+    -- Battery is host info (not game state): poll on its own slow timer whenever the readout is on.
+    if cfg.show_battery and (os.clock() - chat.battery.last_poll) >= 15 then
+        chat.battery.last_poll = os.clock()
+        pcall(chat.battery_poll)
+    end
+
     -- Draw gate: also require the player entity so nothing draws over the character-select
     -- preview or a zone/loading screen (GetPlayerEntity goes non-nil on char select before
     -- you've actually logged in, so GetLoginStatus() == 2 is the real "in the world" signal).
@@ -4095,6 +4218,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         if (imgui.Begin(main_title, chat.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse)) then
             apply_font_scale()
             save_window_geom('main')
+            pcall(chat.battery_draw_titlebar)   -- host battery % in the title bar, right-aligned (opt-in)
 
             -- Measured before anything else is drawn, so this is the window's true full content
             -- width — not "whatever's left after the channel buttons," which is what
