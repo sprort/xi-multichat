@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.2';
+addon.version   = '2.0.3';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -260,6 +260,13 @@ local default_config = {
     -- was popped out at all wasn't, so a reload dropped every pop-out back into the main window.
     -- Kept in step with reality each frame and re-applied on load (see restore_popped_state).
     popped           = {},
+    -- Rest of the last window state, likewise mirrored each frame and re-applied on load, so windows
+    -- come back exactly as you left them rather than a fixed default: which tab was active, whether the
+    -- main and notes windows were open, and the split-view layout.
+    active_channel   = 'linkshell',
+    main_open        = true,
+    notes_open       = false,
+    split_state      = { enabled = false, orientation = 'horizontal', right_channel = 'tell', ratio = 0.55 },
     colors = {
         -- per_channel = false -> use "all"; per_channel = true -> use "channels[<channel>]"
         -- Default all three to each channel's tab color.
@@ -394,6 +401,17 @@ local function apply_cfg_defaults(c)
         c.popped[ch] = (c.popped[ch] == true)
     end
 
+    -- Rest of the last window state (validated against real channels; see restore_popped_state).
+    if type(c.active_channel) ~= 'string' or not chat.messages[c.active_channel] then c.active_channel = 'linkshell' end
+    if type(c.main_open)  ~= 'boolean' then c.main_open  = true  end
+    if type(c.notes_open) ~= 'boolean' then c.notes_open = false end
+    c.split_state = (type(c.split_state) == 'table') and c.split_state or {}
+    if type(c.split_state.enabled) ~= 'boolean' then c.split_state.enabled = false end
+    if c.split_state.orientation ~= 'vertical' then c.split_state.orientation = 'horizontal' end
+    if type(c.split_state.right_channel) ~= 'string' or not chat.messages[c.split_state.right_channel] then c.split_state.right_channel = 'tell' end
+    if type(c.split_state.ratio) ~= 'number' then c.split_state.ratio = 0.55 end
+    c.split_state.ratio = math.max(0.1, math.min(0.9, c.split_state.ratio))
+
     c.colors = c.colors or default_config.colors
     for _, key in ipairs({'timestamp', 'username', 'text'}) do
         c.colors[key] = c.colors[key] or default_config.colors[key]
@@ -413,12 +431,28 @@ end
 -- collapsing into the main window on reload. Takes the config table as an argument rather than
 -- reading the `cfg` local, so it can be defined ahead of it and used by both load paths below.
 local function restore_popped_state(c)
-    if type(c) ~= 'table' or type(c.popped) ~= 'table' then return end
-    for ch, state in pairs(pop) do
-        state.popped = (c.popped[ch] == true)
-        -- A restored pop-out must also be un-closed, or it'd be popped but not drawn.
-        if state.popped then state.is_open[1] = true end
+    if type(c) ~= 'table' then return end
+    if type(c.popped) == 'table' then
+        for ch, state in pairs(pop) do
+            state.popped = (c.popped[ch] == true)
+            -- A restored pop-out must also be un-closed, or it'd be popped but not drawn.
+            if state.popped then state.is_open[1] = true end
+        end
     end
+    -- Rest of the last window state: active tab, main-window open/closed, split view. (Notes is
+    -- restored too, but it's defined further down the file, so it's guarded.)
+    if type(c.active_channel) == 'string' and chat.messages[c.active_channel] then
+        chat.active_channel = c.active_channel
+    end
+    if type(c.main_open) == 'boolean' then chat.is_open[1] = c.main_open end
+    if type(c.split_state) == 'table' then
+        local s = c.split_state
+        if type(s.enabled) == 'boolean' then split.enabled = s.enabled end
+        if s.orientation == 'horizontal' or s.orientation == 'vertical' then split.orientation = s.orientation end
+        if type(s.right_channel) == 'string' and chat.messages[s.right_channel] then split.right_channel = s.right_channel end
+        if type(s.ratio) == 'number' then split.ratio = math.max(0.1, math.min(0.9, s.ratio)) end
+    end
+    if chat.notes and type(c.notes_open) == 'boolean' then chat.notes.is_open[1] = c.notes_open end
 end
 
 local cfg = default_config;
@@ -2556,6 +2590,13 @@ local last_exp_gained = nil
 local function process_system_line(msg)
     if not msg or msg == '' then return end
 
+    -- Magic-burst damage arrives as "Magic Burst! <target> takes N points of damage." -- the game
+    -- prefixes the whole line, so the damage pattern's actor capture would otherwise grab "Magic
+    -- Burst! The Land Worm" as the name. Strip the prefix so the target parses as the actor, and
+    -- remember to fold the "Magic Burst!" note back onto the front of the body (see the loop below).
+    local magic_burst = false
+    do local rest = msg:match('^Magic Burst! (.+)$'); if rest then magic_burst = true; msg = rest end end
+
     -- Side-effect only (doesn't return) -- the actual Combat-tab row for this message is still
     -- appended normally further down, via the generic "gains N experience points." entry in
     -- SYSTEM_MESSAGE_PATTERNS.
@@ -2612,6 +2653,29 @@ local function process_system_line(msg)
         return
     end
 
+    -- Level-ups AND level-downs by you or a party/alliance member also surface in the Party tab (a
+    -- group milestone / mishap), as a copy -- the normal Combat-tab row is still appended by the
+    -- pattern loop below. Up: "Name attains level N!" / "You attain level N."  Down: "Name falls to
+    -- level N." / "You fall to level N." Green for up, light red for down (matching the Combat colors).
+    -- Side-effect only (no return), so the Combat row still happens.
+    do
+        local lvlActor = msg:match("^(.-) attains? level %d+[%.!]?$")
+        local lvlColor = EXP_COLOR
+        if not lvlActor then
+            lvlActor = msg:match("^(.-) falls? to level %d+%.$")
+            lvlColor = {255/255, 150/255, 150/255, 1.0}
+        end
+        if lvlActor and is_plausible_actor(lvlActor) then
+            local body = strip_actor_prefix(msg, lvlActor)
+            local is_self = (lvlActor:lower() == 'you') or (lvlActor:lower() == current_char_name():lower())
+            local who = (lvlActor:lower() == 'you') and current_char_name() or lvlActor
+            who = strip_leading_article(who)
+            if (is_self and who ~= '') or is_genuine_party_member(who) then
+                append_message('party', who, body, true, lvlColor, resolve_uname_color('party', who))
+            end
+        end
+    end
+
     for _, entry in ipairs(SYSTEM_MESSAGE_PATTERNS) do
         if entry.self_only then
             if msg:find(entry.pattern) then
@@ -2640,6 +2704,10 @@ local function process_system_line(msg)
                     actor = rangedOwner
                     body = rangedPhrase .. ' ' .. body
                 end
+                -- Fold the stripped magic-burst note back onto the body: "The Land Worm" (actor) +
+                -- "Magic Burst! takes 35 points of damage." (body). Done before styling so the damage
+                -- number is still highlighted normally.
+                if magic_burst then body = 'Magic Burst! ' .. body end
                 local base, spans = system_row_style(entry, body, matches)
                 if actor:lower() == 'you' then
                     local me = current_char_name()
@@ -3793,7 +3861,7 @@ function sv.draw_autopop()
         imgui.Text('Pop out when:')
         imgui.Indent(12)
         local c = { a.combat }
-        if imgui.Checkbox('You or your party enters combat  -> Combat', c) then a.combat = c[1] end
+        if imgui.Checkbox('You, party/alliance, or pets engage  -> Combat', c) then a.combat = c[1] end
         local cr = { a.craft }
         if imgui.Checkbox('You craft or fish  -> Craft', cr) then a.craft = cr[1] end
         local p = { a.party }
@@ -3932,21 +4000,23 @@ function autopop.eval()
     if not cfg.autopop.enabled then return end
 
     if cfg.autopop.combat then
-        -- Consider the party "in combat" if YOU or ANY active party member is engaged (status 1).
-        -- Keying only off your own engaged status missed casters/support -- who fight without ever
-        -- meleeing -- so the Combat window never popped in a party. Checking every member covers
-        -- that: when the tank/DD engages, your Combat window opens too.
+        -- "In combat" if YOU, any party/ALLIANCE member (the party table's 18 slots: 0-5 your party,
+        -- 6-17 the two alliance parties), or any of their PETS/summons is engaged (status 1). Keying
+        -- only off your own engaged status missed casters/support and pet classes -- who fight without
+        -- ever meleeing themselves -- so the Combat window never popped for them in a group. A member's
+        -- pet is looked up with GetPetTargetIndex(memberIndex) and its status checked the same way.
         local engaged = false
         pcall(function()
             local mm = AshitaCore:GetMemoryManager()
             local party = mm:GetParty()
             local ent = mm:GetEntity()
-            for i = 0, 5 do
+            for i = 0, 17 do
                 if party:GetMemberIsActive(i) == 1 then
                     local idx = party:GetMemberTargetIndex(i)
-                    if idx and idx > 0 and ent:GetStatus(idx) == 1 then   -- 1 = Engaged
-                        engaged = true
-                        break
+                    if idx and idx > 0 then
+                        if ent:GetStatus(idx) == 1 then engaged = true; break end   -- 1 = Engaged
+                        local pet = ent:GetPetTargetIndex(idx)
+                        if pet and pet > 0 and ent:GetStatus(pet) == 1 then engaged = true; break end
                     end
                 end
             end
@@ -4167,6 +4237,16 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- reset) -- that way none can be missed. Ten boolean assignments a frame, no allocation.
     if type(cfg.popped) == 'table' then
         for ch, state in pairs(pop) do cfg.popped[ch] = state.popped end
+    end
+    -- Same idea for the rest of the last window state, so a reload restores exactly what was on screen.
+    cfg.active_channel = chat.active_channel
+    cfg.main_open  = chat.is_open[1] and true or false
+    cfg.notes_open = (chat.notes and chat.notes.is_open[1]) and true or false
+    if type(cfg.split_state) == 'table' then
+        cfg.split_state.enabled       = split.enabled and true or false
+        cfg.split_state.orientation   = split.orientation
+        cfg.split_state.right_channel = split.right_channel
+        cfg.split_state.ratio         = split.ratio
     end
 
     -- Hide every window while a cutscene/event is playing. Messages are still captured (the packet
