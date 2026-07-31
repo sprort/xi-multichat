@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.1';
+addon.version   = '2.0.2';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -2493,6 +2493,27 @@ local function try_broadcast_message(msg)
     -- own username color). Passed explicitly as uname_color -- see draw_channel_messages.
     -- Still shown in every tab, but only SYS is allowed to *alert* (no_alert=true everywhere
     -- else): the copy is everywhere for visibility, without flashing every tab you're not on.
+
+    -- Server "SystemMessage" broadcasts (e.g. maintenance warnings) come as a decorative header line
+    -- ("-----== SystemMessage ==-----") followed by the actual text on the NEXT line. Arm on the
+    -- header, then broadcast that next line to every tab (SYS-only alert). The header row itself is
+    -- consumed (not shown) -- only the message body is displayed.
+    if chat._sysmsg_pending then
+        chat._sysmsg_pending = false
+        local body = msg:gsub('^%s+', ''):gsub('%s+$', '')
+        if body ~= '' then
+            local sc = {180/255, 150/255, 255/255, 1.0}
+            for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
+                append_message(ch, 'System', body, true, sc, sc, nil, ch ~= 'sys')
+            end
+        end
+        return true
+    end
+    if msg:match('^[%s%-=]*System%s*Message[%s%-=]*$') then
+        chat._sysmsg_pending = true
+        return true
+    end
+
     if msg:match("^Achievement Unlocked:") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
             append_message(ch, 'Achievement', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR, nil, ch ~= 'sys')
