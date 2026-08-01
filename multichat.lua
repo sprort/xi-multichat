@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.3';
+addon.version   = '2.0.4';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -236,7 +236,6 @@ local default_config = {
     -- existing installs keep their current transparency). See chat.window_bg.
     windows_uniform = true,
     window_colors = {},
-    last_exp_align = 'left',    -- alignment of the combat window's "Last EXP:" readout: 'left'|'center'|'right'
     ls_names = {},              -- learned linkshell names for the window titles: {linkshell=, linkshell2=}
     shoutyell_filter = 'both', -- 'both' | 'shout' | 'yell' -- which to show in the Shout/Yell channel
     craft_filter     = 'all', -- 'all' | 'mine' -- who to show in the Craft channel
@@ -372,7 +371,6 @@ local function apply_cfg_defaults(c)
         end
         c.window_colors[k] = t
     end
-    if c.last_exp_align ~= 'center' and c.last_exp_align ~= 'right' then c.last_exp_align = 'left' end
 
     if type(c.ls_names) ~= 'table' then c.ls_names = {} end
 
@@ -1387,16 +1385,13 @@ function chat.battery_label()
     return text, {1, 1, 1, 1}
 end
 
--- Draws the battery label right-aligned in the current window's title bar, left of the close button.
--- Uses the foreground draw list (unclipped) since the window draw list is clipped to the content
--- area and wouldn't reach the title bar. Just text, no background. Call right after imgui.Begin.
-function chat.battery_draw_titlebar()
-    if not cfg.show_battery then return end
-    local text, color = chat.battery_label()
-    if not text then return end
-    -- GetWindowPos/GetWindowSize return TWO numbers (x, y) in this binding, not a single ImVec2 --
-    -- capture both. (Taking one value gave the x and left y at 0, which drew the label at the top of
-    -- the screen instead of on the window's title bar.)
+-- Draws `text` in `color` onto the CURRENT window's title bar (call right after imgui.Begin), via the
+-- foreground draw list -- the window draw list is clipped to the content area and wouldn't reach the
+-- title bar. Just text, no background. align = 'right' (left of the [X] close button) or 'center'.
+-- GetWindowPos/GetWindowSize/CalcTextSize return TWO numbers here (x, y), not a single ImVec2, so
+-- both are captured. Drawn at the window's font+size so it matches the title bar and its measured width.
+function chat.titlebar_text(text, color, align)
+    if not text or text == '' then return end
     local px, py, w
     do
         local ok, a, b = pcall(imgui.GetWindowPos)
@@ -1418,14 +1413,11 @@ function chat.battery_draw_titlebar()
             elseif sw ~= nil then tw = get_x(sw); fh = get_y(sw) end
         end
     end
-    local tx = px + w - (titleH + 8) - tw   -- (titleH + 8) leaves room for the [X] close button
+    local tx = (align == 'center') and (px + (w - tw) * 0.5) or (px + w - (titleH + 8) - tw)
     local ty = py + (titleH - fh) * 0.5
     local dl = imgui.GetForegroundDrawList()
     if not dl then return end
     local u = imgui.GetColorU32(color)
-    -- Draw at the window's current font + size (AddText's 5-arg form) so the label matches the title
-    -- bar's scaled font and lines up with tw (measured with CalcTextSize at that same size), rather
-    -- than the tiny default draw-list font. Falls back to the 3-arg form if GetFont isn't available.
     local font, fsize
     pcall(function() font = imgui.GetFont() end)
     pcall(function() fsize = imgui.GetFontSize() end)
@@ -1434,6 +1426,68 @@ function chat.battery_draw_titlebar()
     else
         pcall(function() dl:AddText({tx, ty}, u, text) end)
     end
+end
+
+-- Battery label, right-aligned in the main window's title bar.
+function chat.battery_draw_titlebar()
+    if not cfg.show_battery then return end
+    local text, color = chat.battery_label()
+    chat.titlebar_text(text, color, 'right')
+end
+
+-- ===== EXP per hour =====
+-- Rolling rate of the player's OWN experience gains over the last 15 minutes (recorded in
+-- process_system_line alongside last_exp_gained). Kept on `chat` to avoid top-level locals. Uses
+-- os.time() (real wall-clock seconds) -- NOT os.clock() -- so the rate is measured against real time
+-- rather than a process clock that can run at a different rate. Naturally empties on reload.
+chat.exp_history = {}   -- { {t=, amt=}, ... }, oldest first, pruned to a 900s (15 min) window on record
+
+function chat.exp_record(amt)
+    if type(amt) ~= 'number' or amt <= 0 then return end
+    local h = chat.exp_history
+    h[#h + 1] = { t = os.time(), amt = amt }
+    -- Drop entries older than the 15-minute window from the front, then compact.
+    local now = os.time()
+    local first = 1
+    while first <= #h and (now - h[first].t) > 900 do first = first + 1 end
+    if first > 1 then
+        local n = 0
+        for i = first, #h do n = n + 1; h[n] = h[i] end
+        for i = n + 1, #h do h[i] = nil end
+    end
+end
+
+-- Returns the current EXP/hour (integer), or nil until there's at least a minute of data spanning
+-- two gains -- so an early single gain doesn't extrapolate to a wild number. Rate = total EXP in the
+-- window / the time actually covered (now - oldest gain), so it decays realistically when you stop.
+function chat.exp_per_hour()
+    local h = chat.exp_history
+    if #h < 2 then return nil end
+    local now = os.time()
+    local sum, oldest = 0, nil
+    for i = 1, #h do
+        if (now - h[i].t) <= 900 then
+            sum = sum + h[i].amt
+            if not oldest then oldest = h[i].t end
+        end
+    end
+    if not oldest or sum <= 0 then return nil end
+    local span = now - oldest
+    if span < 60 then return nil end
+    return math.floor(sum / span * 3600 + 0.5)
+end
+
+-- Cached EXP/hour for display: recomputed only every few seconds so the readout holds a steady value
+-- instead of ticking every frame. Returns the last computed value between refreshes.
+chat.exp_rate_shown = nil
+chat.exp_rate_shown_at = 0
+function chat.exp_per_hour_display()
+    local now = os.time()
+    if (now - chat.exp_rate_shown_at) >= 5 then   -- refresh interval (seconds)
+        chat.exp_rate_shown_at = now
+        chat.exp_rate_shown = chat.exp_per_hour()
+    end
+    return chat.exp_rate_shown
 end
 
 -- ===== Notes (persistent scratch pad) =====
@@ -2605,6 +2659,7 @@ local function process_system_line(msg)
         local me = current_char_name()
         if me ~= '' and expActor:lower() == me:lower() then
             last_exp_gained = tonumber(expAmount)
+            chat.exp_record(tonumber(expAmount))   -- feed the EXP/hour rolling window
         end
     end
 
@@ -3764,14 +3819,6 @@ function sv.draw_channels()
         imgui.Spacing()
         if imgui.RadioButton('Everyone##combat', cfg.combat_filter == 'all') then cfg.combat_filter = 'all' end
         if imgui.RadioButton('Myself##combat', cfg.combat_filter == 'mine') then cfg.combat_filter = 'mine' end
-        imgui.Spacing(); imgui.Spacing()
-        imgui.Text('"Last EXP:" alignment:')
-        if imgui.RadioButton('Left##lastexpalign', cfg.last_exp_align == 'left') then cfg.last_exp_align = 'left' end
-        imgui.SameLine()
-        if imgui.RadioButton('Center##lastexpalign', cfg.last_exp_align == 'center') then cfg.last_exp_align = 'center' end
-        imgui.SameLine()
-        if imgui.RadioButton('Right##lastexpalign', cfg.last_exp_align == 'right') then cfg.last_exp_align = 'right' end
-        imgui.TextWrapped('Alignment of the "Last EXP:" line on the popped-out Combat window.')
     else
         imgui.TextWrapped('What shows up in the Shout/Yell tab. Shout and Yell are always shown in different colors so they stay easy to tell apart.')
         imgui.Spacing()
@@ -4130,25 +4177,6 @@ ashita.events.register('unload', 'unload_cb', function ()
     end
 end)
 
--- Draws the popped-out Combat window's "Last EXP:" readout (fixed EXP color), aligned left / center /
--- right per cfg.last_exp_align. Center/right shift the cursor by the leftover width before drawing.
-function chat.draw_last_exp()
-    local label = 'Last EXP: ' .. (last_exp_gained and tostring(last_exp_gained) or '-')
-    local align = cfg.last_exp_align or 'left'
-    if align ~= 'left' then
-        local okAv, avail = pcall(imgui.GetContentRegionAvail)
-        local w = (okAv and avail) and get_x(avail) or 0
-        local okSz, sz = pcall(imgui.CalcTextSize, label)
-        local tw = (okSz and sz) and get_x(sz) or 0
-        local okCx, cx = pcall(imgui.GetCursorPosX)
-        if okCx and type(cx) == 'number' and w > tw then
-            local pad = (align == 'center') and (w - tw) * 0.5 or (w - tw)
-            pcall(imgui.SetCursorPosX, cx + pad)
-        end
-    end
-    imgui.TextColored(EXP_COLOR, label)
-end
-
 -- ========= Draw =========
 ashita.events.register('d3d_present', 'present_cb', function ()
     -- Don't draw anything until a character is actually logged in and loaded into the world.
@@ -4271,6 +4299,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             if imgui.Begin(title, state.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse) then
                 apply_font_scale()
                 save_window_geom(channel)
+                -- The popped-out Combat window shows readouts in its title bar (like the battery on the
+                -- main window): "Last EXP:" centered, and the rolling EXP/hour rate right-aligned.
+                if channel == 'combat' then
+                    chat.titlebar_text('Last EXP: ' .. (last_exp_gained and tostring(last_exp_gained) or '-'), EXP_COLOR, 'center')
+                    local rate = chat.exp_per_hour_display()
+                    chat.titlebar_text('EXP/h: ' .. (rate and tostring(rate) or '-'), EXP_COLOR, 'right')
+                end
                 -- ImGuiFocusedFlags_ChildWindows is required here -- the message area below is
                 -- a separate BeginChild (a child window with its own focus state), and without
                 -- this flag, clicking inside it doesn't count as this outer window being
@@ -4279,14 +4314,6 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 -- clear the alert, only clicking near the buttons did.
                 local focused = false; pcall(function() focused = imgui.IsWindowFocused(ImGuiFocusedFlags_ChildWindows) end)
                 if focused then pop[channel].alert = false end
-                -- A popped-out window is just its title bar and the log. Pop-in now lives on the
-                -- main window's Pop In button and the tab right-click menu; copying lives on the row
-                -- right-click menu ("Copy line" / "Copy log"). Combat keeps its "Last EXP" readout as
-                -- the one exception, on its own line above the log.
-                if channel == 'combat' then
-                    chat.draw_last_exp()
-                    imgui.Separator()
-                end
                 -- Window background already carries the tint; keep the child transparent so it
                 -- doesn't double up (two stacked semi-transparent layers would look more opaque
                 -- than the rest of the window).
