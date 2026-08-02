@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.4';
+addon.version   = '2.0.5';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -2062,6 +2062,8 @@ local SYSTEM_MESSAGE_PATTERNS = {
     { channel = 'combat', pattern = "^(.-) gains %d+ experience points?%.$",            color = EXP_COLOR },
     { channel = 'combat', pattern = "^(.-) attains level %d+!?$",                       color = EXP_COLOR },
     { channel = 'combat', pattern = "^(.-) falls to level %d+%.$",                      color = {255/255, 150/255, 150/255, 1.0} },
+    -- Merit points, treated like a level-up ("Lothar earns a merit point! (Total: 9)").
+    { channel = 'combat', pattern = "^(.-) earns .- merit points?! %(Total: %d+%)$",    color = EXP_COLOR },
 
     -- Craft: synthesis results -- native log shows both in plain white, not the craft tab's
     -- default orange. The "lost" wording was previously wrong ("lost the .- ingredients.",
@@ -2708,10 +2710,10 @@ local function process_system_line(msg)
         return
     end
 
-    -- Level-ups AND level-downs by you or a party/alliance member also surface in the Party tab (a
-    -- group milestone / mishap), as a copy -- the normal Combat-tab row is still appended by the
-    -- pattern loop below. Up: "Name attains level N!" / "You attain level N."  Down: "Name falls to
-    -- level N." / "You fall to level N." Green for up, light red for down (matching the Combat colors).
+    -- Level-ups, level-downs, AND merit points by you or a party/alliance member also surface in the
+    -- Party tab (a group milestone / mishap), as a copy -- the normal Combat-tab row is still appended
+    -- by the pattern loop below. Up: "Name attains level N!" / "You attain level N."  Down: "Name falls
+    -- to level N." Merit: "Name earns a merit point! (Total: N)". Green for up/merit, light red for down.
     -- Side-effect only (no return), so the Combat row still happens.
     do
         local lvlActor = msg:match("^(.-) attains? level %d+[%.!]?$")
@@ -2719,6 +2721,10 @@ local function process_system_line(msg)
         if not lvlActor then
             lvlActor = msg:match("^(.-) falls? to level %d+%.$")
             lvlColor = {255/255, 150/255, 150/255, 1.0}
+        end
+        if not lvlActor then
+            lvlActor = msg:match("^(.-) earns .- merit points?! %(Total: %d+%)$")
+            lvlColor = EXP_COLOR
         end
         if lvlActor and is_plausible_actor(lvlActor) then
             local body = strip_actor_prefix(msg, lvlActor)
