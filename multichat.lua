@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.5';
+addon.version   = '2.0.6';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -2735,6 +2735,20 @@ local function process_system_line(msg)
                 append_message('party', who, body, true, lvlColor, resolve_uname_color('party', who))
             end
         end
+    end
+
+    -- Level Sync notices are a party mechanic, so route the whole family to the Party tab under the
+    -- "LevelSync" name instead of leaving them as unrouted system text. Matched on substrings (plain
+    -- find) so every variant is covered: activation/deactivation/"will be deactivated", the party-
+    -- level restriction, the "removed synchronization / designee left" line, the "straying too far"
+    -- and "experience points will become unavailable" lines, and the equipment-adjust line. Player
+    -- chat can't reach here (ordinary chat modes are excluded upstream), so these can't false-match.
+    if msg:find('Level Sync', 1, true)
+        or msg:find('level has been restricted', 1, true)
+        or msg:find('level restriction', 1, true) then
+        local sync_color = {160/255, 210/255, 255/255, 1.0}
+        append_message('party', 'LevelSync', msg, true, sync_color, sync_color)
+        return
     end
 
     for _, entry in ipairs(SYSTEM_MESSAGE_PATTERNS) do
