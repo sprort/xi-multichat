@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.6';
+addon.version   = '2.0.7';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -2049,6 +2049,27 @@ local SYSTEM_MESSAGE_PATTERNS = {
     -- of land crab meat on the Clipper." / "Sprort obtains a slice of land crab meat.").
     { channel = 'combat', pattern = "^You find (.-) on .-%.$",           item_capture = 1, self_only = true, color = ITEM_COLOR },
     { channel = 'combat', pattern = "^(.-) obtains (.-)%.$",             item_capture = 2, color = ITEM_COLOR },
+
+    -- Steal / Mug (THF). The ability USE ("Sprort uses Steal.") is already caught by the "uses"
+    -- pattern above; these are the RESULT lines, which were being dropped entirely (no pattern
+    -- matched, so they never reached the log OR the Combat window). Wording was NOT recoverable
+    -- from the logs since the drops were never captured -- these cover FFXI's standard forms:
+    -- self ("You steal a X.") vs. others ("<Name> steals a X."), the "successfully steals"
+    -- variant, an optional "from the <mob>" tail, gil (Mug), and the failure line. NOT yet
+    -- verified against a real steal-result screenshot -- flag if any variant slips through.
+    -- Failure lines MUST come first: they also contain the word "steal"/"mug", so a success
+    -- pattern would otherwise swallow "You fail to steal from the X." (grabbing "You fail to" as
+    -- the actor). Among the success forms, "from" variants come before the plain ones so the loot
+    -- capture stops before the target rather than running past it.
+    { channel = 'combat', pattern = "^(.-) fails? to steal.-%.$",                                      color = ABILITY_COLOR },
+    { channel = 'combat', pattern = "^(.-) fails? to mug.-%.$",                                        color = ABILITY_COLOR },
+    { channel = 'combat', pattern = "^(.-) successfully steals? (.-) from .-[%.!]$", item_capture = 2, color = ITEM_COLOR },
+    { channel = 'combat', pattern = "^(.-) successfully steals? (.-)[%.!]$",         item_capture = 2, color = ITEM_COLOR },
+    { channel = 'combat', pattern = "^(.-) steals? (.-) from .-[%.!]$",              item_capture = 2, color = ITEM_COLOR },
+    { channel = 'combat', pattern = "^(.-) steals? (.-)[%.!]$",                      item_capture = 2, color = ITEM_COLOR },
+    { channel = 'combat', pattern = "^(.-) mugs? (.-) from .-[%.!]$",                item_capture = 2, color = ITEM_COLOR },
+    { channel = 'combat', pattern = "^(.-) mugs? (.-)[%.!]$",                        item_capture = 2, color = ITEM_COLOR },
+
     -- Quest/event rewards -- no actor name in the text at all (confirmed via in-game
     -- screenshot: "Obtained: Page from the Dragon Chronicles.", "Obtained: 10000 gil."). Routed
     -- to Quest, not Combat, since these are quest rewards rather than combat loot.
