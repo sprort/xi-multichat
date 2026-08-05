@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.7';
+addon.version   = '2.0.8';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -2632,7 +2632,12 @@ local function try_broadcast_message(msg)
         return true
     end
 
-    if msg:match("^★ .- has reached level %d+ on .- as a hardcore character! ★$") then
+    -- The "reached level" milestone is wrapped in ★ decorative stars, but FFXI delivers text in
+    -- its own Shift-JIS-based encoding, so the game's star byte(s) do NOT equal the UTF-8 ★ saved
+    -- in this source file -- anchoring on "^★ ... ★$" never matched and the line was dropped. Match
+    -- on the distinctive inner phrase instead (substring, no anchors, no stars), which can't trip
+    -- an ordinary chat line. msg is still displayed verbatim, decorative stars and all.
+    if msg:match("has reached level %d+ on .- as a hardcore character") then
         for _, ch in ipairs(ACHIEVEMENT_CHANNELS) do
             append_message(ch, 'Hardcore', msg, true, ACHIEVEMENT_COLOR, ACHIEVEMENT_COLOR, nil, ch ~= 'sys')
         end
