@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.8';
+addon.version   = '2.0.9';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -96,6 +96,15 @@ end
 function RingBuffer:last()
     if self.count == 0 then return nil end
     return self.slots[(self.head + self.count - 2) % self.capacity + 1]
+end
+
+-- Empties the buffer. Used when switching characters (relog to a DIFFERENT character without
+-- reloading the addon) so the new character doesn't inherit the previous one's scrollback --
+-- each character restores its own saved history instead. See the per-character block in d3d_present.
+function RingBuffer:clear()
+    self.slots = {}
+    self.head = 1
+    self.count = 0
 end
 
 local chat = {
@@ -1055,17 +1064,10 @@ local function restore_history()
             end
         end
     end
-    -- Mark the boundary between everything just restored (previous sessions) and this one. This runs
-    -- once, on the first in-world frame after the addon loads. If a logged-out state (character
-    -- select, status 0) was seen before that frame, this load began at a genuine login, so it's a
-    -- "logged in" divider; otherwise the addon was reloaded mid-game ("reloaded"). The login-edge
-    -- check in d3d_present can't cover this first login because history_restored isn't set yet when
-    -- it runs, so the reason is decided here instead.
-    if sbreak.saw_logout then
-        sbreak.push('login', current_char_name())
-    else
-        sbreak.push('reload')
-    end
+    -- The session-boundary divider that marks where the restored (previous-session) rows end and
+    -- this session begins is NOT pushed here anymore -- the caller pushes it right after this
+    -- returns, so it still fires with the correct, now-stable character name even for a character
+    -- that has no saved-history file yet (in which case this function returns early, above).
 end
 
 -- ===== Per-tab plain-text logging =====
@@ -1265,7 +1267,12 @@ end
 
 local update_available_version = nil
 local update_check_done = false
-local history_restored = false
+-- The character whose saved history is currently loaded into the message buffers (nil until the
+-- first load). Keyed on the name -- rather than a one-shot "restored yet?" flag -- so switching
+-- characters without reloading the addon reloads THAT character's own history instead of leaving
+-- the previous character's scrollback (and its login divider) in place, and stops one character's
+-- messages from being saved into another's file. See the per-character block in d3d_present.
+local history_char = nil
 local last_history_save = 0
 local last_log_flush = 0
 
@@ -4242,14 +4249,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- which also requires the player entity) so a zone change doesn't split your logs.
     manage_log_session(logged_in, real_logout)
 
-    -- A relog drops a session divider into the tabs, the same way a fresh addon load does after
-    -- restoring history. The very first login after load is left to restore_history below (it
-    -- resets saw_logout), so a logged-out state seen before that first login isn't a relog.
+    -- Remember that a genuine logged-out state (character select) was seen, so the per-character
+    -- history block below (past the draw gate, where the character name is stable) can tell a real
+    -- login/character-switch apart from an addon reload and label its divider accordingly. The
+    -- divider itself is pushed there, NOT here: pushing it at this login edge captured the name
+    -- before the game had swapped it in, which mislabeled the divider (e.g. two relogs showed their
+    -- character names on the wrong timestamps).
     if real_logout then sbreak.saw_logout = true end
-    if logged_in and sbreak.saw_logout and history_restored then
-        sbreak.push('login', current_char_name())
-        sbreak.saw_logout = false
-    end
 
     pcall(ensure_log_files)   -- create empty files for selected tabs up front (shared login stamp)
     if (os.clock() - last_log_flush) >= LOG_FLUSH_INTERVAL then
@@ -4271,16 +4277,25 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     -- Auto pop-out: evaluate the combat/party/craft triggers and pop/return tabs accordingly.
     pcall(autopop.eval)
 
-    -- Restore saved history once, the first frame the character is known (buffers are still
-    -- empty here -- nothing's arrived yet post-login -- so restored rows land in order), then
-    -- save periodically so a crash (which fires no unload) loses at most one interval. Done
-    -- BEFORE the update check below so the update's SYS line appends after the restored SYS
-    -- history (at the bottom, newest) rather than above it.
-    if not history_restored then
-        history_restored = true
+    -- Per-character history + session divider. Runs past the draw gate, where current_char_name()
+    -- is stable, so the divider is labeled with the RIGHT character. Keyed on the name rather than
+    -- a one-shot flag: the first login after load AND a later switch to a DIFFERENT character both
+    -- take this branch. On a switch, the previous character's rows are dropped from memory first --
+    -- otherwise the new character would show (and re-save into its own file) the old one's
+    -- scrollback and login divider. The previous character's own history was already written to its
+    -- own file by the periodic save below during its session. Restore runs before the update check
+    -- so the update's SYS line lands after the restored SYS history, not above it.
+    local cur = current_char_name()
+    if cur ~= '' and cur ~= history_char then
+        if history_char ~= nil then
+            for _, buf in pairs(chat.messages) do buf:clear() end
+        end
+        history_char = cur
         pcall(restore_history)
-        -- restore_history already dropped this load's divider; clear any logged-out state seen
-        -- before the first login (e.g. sitting at character select) so it isn't read as a relog.
+        -- Push this session's boundary divider now that the correct name is known: "login" if a
+        -- logged-out state (character select) was seen first -- a genuine login or a switch -- else
+        -- "reloaded" (the addon was reloaded mid-game with no logout in between).
+        sbreak.push(sbreak.saw_logout and 'login' or 'reload', cur)
         sbreak.saw_logout = false
         last_history_save = os.clock()
     elseif (os.clock() - last_history_save) >= HISTORY_SAVE_INTERVAL then
