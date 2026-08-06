@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.1.0';
+addon.version   = '2.1.1';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -1878,31 +1878,34 @@ local ASHITA_CREAM_COLOR   = {255/255, 250/255, 205/255, 1.0} -- ~cream/yellow (
 local CHECKER_AQUA_COLOR   = {  0/255, 255/255, 255/255, 1.0} -- Aqua (index 82)
 local CHECKER_PURPLE_COLOR = {153/255,  50/255, 204/255, 1.0} -- DarkOrchid (index 81)
 
--- Returns true (and appends to SYS) if this is a Checker line, false otherwise. Rebuilds the
--- message from its parsed pieces (name/level/verdict/conditions) rather than just passing the
--- raw text through, so each piece can carry its own color span -- matching the native log's
--- own per-segment coloring instead of one flat row color.
-local function try_checker_message(line)
-    local body = line:match("^%[checker%] (.+)$")
-    if not body then return false end
-
-    -- "-" is a Lua pattern magic character (lazy-repetition quantifier), so the literal "->"
-    -- arrow needs escaping as "%->" here -- unlike the plain string literal passed to push()
-    -- below, which isn't a pattern and needs no escaping.
-    local name, level, rest = body:match("^(.-) %-> %(Lv%. (.-)%) (.+)$")
-    if not name then
-        -- Unexpected format (e.g. a future Checker update) -- fall back to showing the line
-        -- as-is, uncolored, rather than silently dropping it. no_alert: a /check result is an
-        -- on-demand action the player just took, so it shouldn't flash the SYS tab for attention.
-        append_message('sys', 'Checker', body, true, nil, nil, nil, true)
-        return true
+-- Appends a finished /check row to SYS (its home tab) AND to whatever tab the main window is
+-- currently showing, so a check is visible without leaving the tab you're on. Username is "Check";
+-- no_alert throughout since a /check is an on-demand action the player just performed (nothing to
+-- flag for attention). spans is shallow-copied per target because append_message may append
+-- name-mention spans to the list it's handed, and the two rows must not share one mutable list.
+-- (Hung on the `chat` table rather than added as top-level locals -- this file sits at Lua's
+-- 200-locals-per-chunk cap.)
+function chat.append_check(msg, spans)
+    local function copy_spans()
+        if not spans then return nil end
+        local t = {}
+        for i, s in ipairs(spans) do t[i] = s end
+        return t
     end
+    append_message('sys', 'Check', msg, true, nil, nil, copy_spans(), true)
+    local ac = chat.active_channel
+    if ac and ac ~= 'sys' and chat.messages[ac] then
+        append_message(ac, 'Check', msg, true, nil, nil, copy_spans(), true)
+    end
+end
 
-    -- The verdict is followed by "(conditions)" only when the check actually returned any
-    -- (Checker's own conditions table has an empty-string entry for "no notable conditions").
-    local verdict, condition = rest:match("^(.-) %((.-)%)$")
-    if not verdict then verdict = rest end
-
+-- Renders one /check result as a "Name -> (Lv. X) verdict (conditions)" row, each piece in its own
+-- color span (matching the native log's per-segment coloring rather than one flat row color).
+-- Shared by BOTH sources of check results: the Checker addon's printed text (parsed in
+-- try_checker_message) and MultiChat's own native-/check packet reader (see the 0x0029 handler
+-- below), so the two look identical. levelStr is already stringified ('55' or '???'); condition
+-- may be '' (none).
+function chat.emit_check(name, levelStr, verdict, condition)
     local parts, spans, pos = {}, {}, 1
     local function push(str, color)
         table.insert(parts, str)
@@ -1913,7 +1916,7 @@ local function try_checker_message(line)
     push(' ')
     push('->', CHECKER_AQUA_COLOR)
     push(' (Lv. ', CHECKER_PURPLE_COLOR)
-    push(level, CHECKER_AQUA_COLOR)
+    push(levelStr, CHECKER_AQUA_COLOR)
     push(')', CHECKER_PURPLE_COLOR)
     push(' ')
     push(verdict, checker_tier_color(verdict))
@@ -1922,12 +1925,95 @@ local function try_checker_message(line)
         push(condition, ASHITA_CREAM_COLOR)
         push(')', CHECKER_PURPLE_COLOR)
     end
+    chat.append_check(table.concat(parts), spans)
+end
 
-    -- no_alert (8th arg): a /check is an on-demand action the player just performed, so the result
-    -- shouldn't flash the SYS tab to get attention the way an unsolicited system message would.
-    append_message('sys', 'Checker', table.concat(parts), true, nil, nil, spans, true)
+-- Returns true (and appends to SYS) if this is a Checker-ADDON line, false otherwise. Parses the
+-- printed "[checker] Name -> (Lv. X) verdict (conditions)" text into pieces for emit_check.
+local function try_checker_message(line)
+    local body = line:match("^%[checker%] (.+)$")
+    if not body then return false end
+
+    -- Seeing a real Checker-addon line means that addon is installed and reformatting /check for
+    -- us -- so MultiChat's own native-/check packet reader stands down to avoid double output.
+    chat.checker_addon_active = true
+
+    -- "-" is a Lua pattern magic character (lazy-repetition quantifier), so the literal "->"
+    -- arrow needs escaping as "%->" here.
+    local name, level, rest = body:match("^(.-) %-> %(Lv%. (.-)%) (.+)$")
+    if not name then
+        -- Unexpected format (e.g. a future Checker update) -- fall back to showing the line
+        -- as-is, uncolored, rather than silently dropping it.
+        chat.append_check(body, nil)
+        return true
+    end
+
+    -- The verdict is followed by "(conditions)" only when the check actually returned any
+    -- (Checker's own conditions table has an empty-string entry for "no notable conditions").
+    local verdict, condition = rest:match("^(.-) %((.-)%)$")
+    if not verdict then verdict = rest end
+
+    chat.emit_check(name, level, verdict, condition)
     return true
 end
+
+-- ===== Native /check (no Checker addon) =====
+-- When the Checker addon ISN'T installed, /check just prints the game's own plain text ("The X
+-- seems too weak to be worthwhile." / "It seems to have high evasion and defense.") which MultiChat
+-- would otherwise drop. Rather than fragile text-matching of every difficulty/condition phrasing,
+-- read the same 0x0029 "Message Basic" packet the Checker addon reads (see addons/checker/
+-- checker.lua) -- it carries the level, difficulty tier, and evasion/defense assessment as numeric
+-- fields, so the result is exact and renders identically to Checker's via emit_check. These maps
+-- mirror Checker's own tables; the verdict strings match CHECKER_TIER_COLORS' prefixes so they
+-- pick up the right tier color.
+-- (Hung on `chat` rather than top-level locals -- 200-locals-per-chunk cap.)
+chat.CHECK_TYPES = {
+    [0x40] = 'too weak to be worthwhile',
+    [0x41] = 'like incredibly easy prey',
+    [0x42] = 'like easy prey',
+    [0x43] = 'like a decent challenge',
+    [0x44] = 'like an even match',
+    [0x45] = 'tough',
+    [0x46] = 'very tough',
+    [0x47] = 'incredibly tough',
+}
+chat.CHECK_CONDITIONS = {
+    [0xAA] = 'High Evasion, High Defense',
+    [0xAB] = 'High Evasion',
+    [0xAC] = 'High Evasion, Low Defense',
+    [0xAD] = 'High Defense',
+    [0xAE] = '',                              -- normal evasion/defense (no note)
+    [0xAF] = 'Low Defense',
+    [0xB0] = 'Low Evasion, High Defense',
+    [0xB1] = 'Low Evasion',
+    [0xB2] = 'Low Evasion, Low Defense',
+}
+
+ashita.events.register('packet_in', 'multichat_check_cb', function (e)
+    if e.id ~= 0x0029 then return end
+    -- Stand down if the Checker addon is handling /check: it blocks this packet and prints its own
+    -- [checker] line (caught by try_checker_message). e.blocked covers its handler running before
+    -- ours; checker_addon_active covers ours running first on an earlier check this session.
+    if e.blocked or chat.checker_addon_active then return end
+    pcall(function()
+        local p2 = struct.unpack('L', e.data, 0x10 + 0x01)   -- difficulty tier
+        local m  = struct.unpack('H', e.data, 0x18 + 0x01)   -- evasion/defense assessment
+        local impossible = (m == 0xF9)
+        -- Only treat this as a /check result if the fields are the ones a check carries -- other
+        -- 0x0029 messages (there are many) won't have both a known tier and a known assessment.
+        if not impossible and (chat.CHECK_CONDITIONS[m] == nil or chat.CHECK_TYPES[p2] == nil) then return end
+        local target = struct.unpack('H', e.data, 0x16 + 0x01)
+        local entity = GetEntity(target)
+        if entity == nil or entity.Name == nil or entity.Name == '' then return end
+        local p1 = struct.unpack('l', e.data, 0x0C + 0x01)   -- level; <=0 when it can't be gauged
+        local levelStr = (p1 and p1 > 0) and tostring(p1) or '???'
+        if impossible then
+            chat.emit_check(entity.Name, levelStr, 'Impossible to gauge!', '')
+        else
+            chat.emit_check(entity.Name, levelStr, chat.CHECK_TYPES[p2], chat.CHECK_CONDITIONS[m])
+        end
+    end)
+end)
 
 -- Server's own periodic "Conquest update:" broadcast (native text, not any addon's output) --
 -- text matching rather than mode, same reasoning as Auction House/Checker above. Requires an
