@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.0.9';
+addon.version   = '2.1.0';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -1892,8 +1892,9 @@ local function try_checker_message(line)
     local name, level, rest = body:match("^(.-) %-> %(Lv%. (.-)%) (.+)$")
     if not name then
         -- Unexpected format (e.g. a future Checker update) -- fall back to showing the line
-        -- as-is, uncolored, rather than silently dropping it.
-        append_message('sys', 'Checker', body, true)
+        -- as-is, uncolored, rather than silently dropping it. no_alert: a /check result is an
+        -- on-demand action the player just took, so it shouldn't flash the SYS tab for attention.
+        append_message('sys', 'Checker', body, true, nil, nil, nil, true)
         return true
     end
 
@@ -1922,7 +1923,9 @@ local function try_checker_message(line)
         push(')', CHECKER_PURPLE_COLOR)
     end
 
-    append_message('sys', 'Checker', table.concat(parts), true, nil, nil, spans)
+    -- no_alert (8th arg): a /check is an on-demand action the player just performed, so the result
+    -- shouldn't flash the SYS tab to get attention the way an unsolicited system message would.
+    append_message('sys', 'Checker', table.concat(parts), true, nil, nil, spans, true)
     return true
 end
 
