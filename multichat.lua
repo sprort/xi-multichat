@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.1.1';
+addon.version   = '2.2.0';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -138,7 +138,8 @@ local settings_ui = {
 -- per-channel trigger edges and which windows auto-pop opened (so auto-close only closes those).
 local autopop = { last_craft = 0, state = {}, owned = {}, close_at = {} }
 
--- Measured width (in pixels) of the main window's Pop Out/Split/Copy/Settings button cluster,
+-- Measured width (in pixels) of the main window's Notes/Settings button cluster (Pop Out and Split
+-- buttons were removed -- those live on the tab right-click menu now),
 -- used to right-align it flush against the window's edge. Self-corrected every frame (see where
 -- it's used below) from the buttons' actual rendered rects rather than an estimated formula, so
 -- it's pixel-accurate regardless of font/DPI/padding quirks an estimate could get wrong. Starts
@@ -214,7 +215,9 @@ local default_config = {
         sys        = { x = 475, y = 475, w = 420, h = 360 },
     },
     chat_bg_alpha    = 0.25,  -- chat log child background opacity (0..1), set from the Settings window
-    font_scale       = 1.0,   -- per-window text scale multiplier (0.5 .. 2.5)
+    font_scale       = 1.0,   -- chat-area (timestamp/username/message) text scale multiplier (0.5 .. 2.5)
+    tab_font_scale   = 1.0,   -- channel-tab-button (LS1/Party/Notes/...) text scale, independent of font_scale
+    titlebar_font_scale = 1.0,-- window title-bar text scale, independent of the other two
     line_spacing     = 0,     -- vertical pixel gap between chat lines (0 .. 16), independent of font_scale
     dedupe_sec       = 1.5,   -- window for duplicate suppression
     timestamp_format = 'hms', -- 'hms' (HH:MM:SS) | 'hm' (HH:MM)
@@ -316,6 +319,8 @@ local default_config = {
 local function apply_cfg_defaults(c)
     c.chat_bg_alpha     = (c.chat_bg_alpha ~= nil) and c.chat_bg_alpha or 0.25
     c.font_scale        = c.font_scale or 1.0
+    c.tab_font_scale    = c.tab_font_scale or 1.0
+    c.titlebar_font_scale = c.titlebar_font_scale or 1.0
     c.line_spacing      = (c.line_spacing ~= nil) and c.line_spacing or 0
     c.dedupe_sec        = c.dedupe_sec or 1.5
     c.timestamp_format  = c.timestamp_format or 'hms'
@@ -605,6 +610,15 @@ end
 -- since ImGui does not propagate a parent window's font scale down into its children.
 local function apply_font_scale()
     pcall(function() imgui.SetWindowFontScale(cfg.font_scale or 1.0) end)
+end
+
+-- Leaves the current window's persistent font scale at the title-bar size. Call this right BEFORE
+-- imgui.End() of a titled window: ImGui draws the title bar during the NEXT frame's Begin() using
+-- the scale left over from this frame, so THIS (not a call after Begin) is what actually sizes the
+-- title text -- letting it differ from the body scale set earlier in the frame. Costs a one-frame
+-- lag while dragging the slider, imperceptible in practice.
+local function leave_titlebar_font_scale()
+    pcall(function() imgui.SetWindowFontScale(cfg.titlebar_font_scale or 1.0) end)
 end
 
 -- Theme accent used for buttons, headers, checkmarks, sliders, and the settings swatch. The window
@@ -1593,6 +1607,7 @@ function chat.notes_draw()
         if pushed_field > 0 then pcall(function() imgui.PopStyleColor(pushed_field) end) end
         if ok and changed then chat.notes.dirty = true end
     end
+    leave_titlebar_font_scale()
     imgui.End()
     if okBg then pcall(function() imgui.PopStyleColor(1) end) end
     if pushed_tb > 0 then pcall(function() imgui.PopStyleColor(pushed_tb) end) end
@@ -3602,8 +3617,8 @@ local function colored_button(label, color, invert_flash)
 end
 
 -- Colored to match the window's own (inactive) title bar
--- instead of gray -- used for the main window's Pop Out/Split/Copy row so they read as part of
--- the window chrome rather than secondary/neutral actions. Uses TITLEBAR_INACTIVE (darker)
+-- instead of gray -- used for the main window's Notes button (and the pop-out title-bar controls)
+-- so they read as part of the window chrome rather than secondary/neutral actions. Uses TITLEBAR_INACTIVE (darker)
 -- rather than TITLEBAR_ACTIVE, since the brighter active shade was too close to the title bar
 -- itself and didn't read as distinctly as buttons. Slightly tighter FramePadding than the
 -- channel tab buttons use, so this row reads as visually smaller/secondary to them.
@@ -3664,37 +3679,6 @@ local function pick_alternate_left(exclude)
     -- LOGGABLE_ORDER doubles as the canonical full channel order (same list).
     for _,c in ipairs(LOGGABLE_ORDER) do if c ~= exclude then return c end end
     return exclude
-end
-
--- Split toggle button: click to enable/disable, right-click to choose orientation.
--- Border-highlighted (same treatment as the active channel tab) whenever split is on.
-local function draw_split_toggle_button()
-    local pushed_vars = 0
-    local pushed_border_color = 0
-    if split.enabled then
-        if pcall(function() imgui.PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2) end) then pushed_vars = pushed_vars + 1 end
-        if pcall(function() imgui.PushStyleColor(ImGuiCol_Border, {1,1,1,1}) end) then pushed_border_color = pushed_border_color + 1 end
-    end
-
-    if titlebar_color_button('Split') then
-        if split.enabled then
-            split.enabled = false
-        else
-            if split.right_channel == chat.active_channel then
-                split.right_channel = pick_alternate_left(chat.active_channel)
-            end
-            split.enabled = true
-        end
-    end
-
-    if pushed_border_color > 0 then pcall(function() imgui.PopStyleColor(pushed_border_color) end) end
-    if pushed_vars > 0 then pcall(function() imgui.PopStyleVar(pushed_vars) end) end
-
-    if imgui.BeginPopupContextItem('ctx_split') then
-        if imgui.MenuItem('Side by Side') then split.orientation = 'horizontal' end
-        if imgui.MenuItem('Stacked') then split.orientation = 'vertical' end
-        imgui.EndPopup()
-    end
 end
 
 -- ===== Settings window (XIUI-style: left-sidebar sections + top sub-tabs) =====
@@ -3857,12 +3841,31 @@ function sv.draw_general()
         imgui.TextWrapped('Window background color and transparency are set per window under Colors -> Windows (with an "all windows the same" option).')
         imgui.Spacing()
 
-        imgui.Text('Font size:')
+        local fmin, fmax = math.floor(FONT_BASE_SIZE * 0.5), math.floor(FONT_BASE_SIZE * 2.5)
+
+        imgui.Text('Chat font size:')
         local fref = { math.floor(((cfg.font_scale or 1.0) * FONT_BASE_SIZE) + 0.5) }
         imgui.SetNextItemWidth(220)
-        if imgui.SliderInt('##fontscale', fref, math.floor(FONT_BASE_SIZE * 0.5), math.floor(FONT_BASE_SIZE * 2.5), '%dpx') then
+        if imgui.SliderInt('##fontscale', fref, fmin, fmax, '%dpx') then
             cfg.font_scale = fref[1] / FONT_BASE_SIZE
         end
+        imgui.TextWrapped('Timestamp, username, and message text in the chat area.')
+
+        imgui.Text('Tab font size:')
+        local tref = { math.floor(((cfg.tab_font_scale or 1.0) * FONT_BASE_SIZE) + 0.5) }
+        imgui.SetNextItemWidth(220)
+        if imgui.SliderInt('##tabfontscale', tref, fmin, fmax, '%dpx') then
+            cfg.tab_font_scale = tref[1] / FONT_BASE_SIZE
+        end
+        imgui.TextWrapped('The channel-tab buttons (LS1, LS2, Party, ...) and the Notes button.')
+
+        imgui.Text('Title bar font size:')
+        local bref = { math.floor(((cfg.titlebar_font_scale or 1.0) * FONT_BASE_SIZE) + 0.5) }
+        imgui.SetNextItemWidth(220)
+        if imgui.SliderInt('##titlebarfontscale', bref, fmin, fmax, '%dpx') then
+            cfg.titlebar_font_scale = bref[1] / FONT_BASE_SIZE
+        end
+        imgui.TextWrapped('The window title bars (main window, pop-outs, and notes), plus the title-bar readouts: battery %, and the Combat window\'s Last EXP and EXP/h. Updates one frame after you drag.')
 
         imgui.Text('Line spacing:')
         local lref = { cfg.line_spacing or 0 }
@@ -4029,9 +4032,12 @@ function sv.draw_notes()
 end
 
 function sv.draw_help()
+    if sv.section('Pop-Out Windows') then
+        imgui.TextWrapped('Right-click any channel tab (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) and choose "Pop Out" to move it into its own floating window. Right-click again and choose "Pop In" to fold it back. You can pop out any number of channels at once.')
+    end
     if sv.section('Split View') then
         imgui.TextWrapped('Right-click any channel tab (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) and choose "Open in Split View" to show two channels at once.')
-        imgui.TextWrapped('Or click the Split button next to Pop Out in the main window to toggle it on/off. Right-click the Split button to choose Side by Side or Stacked layout.')
+        imgui.TextWrapped('While a split is open, right-click any tab for "Side by Side" or "Stacked" layout, "Swap Views", or "Close Split View".')
         imgui.TextWrapped('Drag the divider between the two panes to resize them.')
     end
     if sv.section('Japanese / CJK Text') then
@@ -4410,9 +4416,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     if force_center_frames > 0 then force_center_frames = force_center_frames - 1 end
 
     -- Mirror the live popped-out state into the config so it's what gets saved. Done here, in
-    -- one place, rather than at each of the several spots that toggle it (the Pop Out/Pop In
-    -- buttons, the tab right-click menu, closing a popped window, /multichat show, /multichat
-    -- reset) -- that way none can be missed. Ten boolean assignments a frame, no allocation.
+    -- one place, rather than at each of the several spots that toggle it (the tab right-click
+    -- menu, closing a popped window, /multichat show, /multichat reset) -- that way none can be
+    -- missed. Ten boolean assignments a frame, no allocation.
     if type(cfg.popped) == 'table' then
         for ch, state in pairs(pop) do cfg.popped[ch] = state.popped end
     end
@@ -4447,14 +4453,23 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             local pushed_titlebar = push_titlebar_color()
             imgui.PushStyleColor(ImGuiCol_WindowBg, chat.window_bg(channel))
             if imgui.Begin(title, state.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse) then
-                apply_font_scale()
+                -- Keep this window's own scale neutral (1.0): its message child multiplies its font
+                -- scale by this parent's, so a non-1.0 value here would scale the chat text by more
+                -- than font_scale alone (see the same fix on the main window). The title bar drew
+                -- during Begin at titlebar_font_scale (left over from leave_titlebar_font_scale last
+                -- frame); the EXP overlay below sets its own scale explicitly.
+                pcall(function() imgui.SetWindowFontScale(1.0) end)
                 save_window_geom(channel)
                 -- The popped-out Combat window shows readouts in its title bar (like the battery on the
                 -- main window): "Last EXP:" centered, and the rolling EXP/hour rate right-aligned.
+                -- Sized by titlebar_font_scale (title-bar furniture), then restored to neutral for
+                -- the message child.
                 if channel == 'combat' then
+                    pcall(function() imgui.SetWindowFontScale(cfg.titlebar_font_scale or 1.0) end)
                     chat.titlebar_text('Last EXP: ' .. (last_exp_gained and tostring(last_exp_gained) or '-'), EXP_COLOR, 'center')
                     local rate = chat.exp_per_hour_display()
                     chat.titlebar_text('EXP/h: ' .. (rate and tostring(rate) or '-'), EXP_COLOR, 'right')
+                    pcall(function() imgui.SetWindowFontScale(1.0) end)
                 end
                 -- ImGuiFocusedFlags_ChildWindows is required here -- the message area below is
                 -- a separate BeginChild (a child window with its own focus state), and without
@@ -4478,6 +4493,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 end
                 imgui.EndChild(); imgui.PopStyleColor(1)
             end
+            leave_titlebar_font_scale()
             imgui.End(); imgui.PopStyleColor(1)
             if pushed_titlebar > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar) end) end
             if not state.is_open[1] then state.popped=false; state.is_open[1]=true end
@@ -4494,9 +4510,19 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         -- make ImGui treat this as a brand-new window each time (losing position/size/focus).
         local main_title = 'MultiChat - ' .. (channelLabels[chat.active_channel] or chat.active_channel) .. chat.title_suffix(chat.active_channel) .. '###MultiChatMain'
         if (imgui.Begin(main_title, chat.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse)) then
-            apply_font_scale()
+            -- The main window's own scale drives the channel-tab / Notes buttons (its only directly
+            -- drawn text). The message area gets its own scale via apply_font_scale() inside each
+            -- message child below (a child is a separate imgui window, so its font scale is set
+            -- independently), which is why the two sliders -- tab_font_scale vs font_scale -- can
+            -- differ. SetWindowFontScale persists per-window, so it's re-set here every frame.
+            pcall(function() imgui.SetWindowFontScale(cfg.tab_font_scale or 1.0) end)
             save_window_geom('main')
+            -- Battery overlay is title-bar furniture, so size it by titlebar_font_scale (it draws
+            -- via GetFontSize, which reads the window's current scale), then restore tab_font_scale
+            -- for the channel buttons below.
+            pcall(function() imgui.SetWindowFontScale(cfg.titlebar_font_scale or 1.0) end)
             pcall(chat.battery_draw_titlebar)   -- host battery % in the title bar, right-aligned (opt-in)
+            pcall(function() imgui.SetWindowFontScale(cfg.tab_font_scale or 1.0) end)
 
             -- Measured before anything else is drawn, so this is the window's true full content
             -- width — not "whatever's left after the channel buttons," which is what
@@ -4525,12 +4551,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 if pushed_vars > 0 then pcall(function() imgui.PopStyleVar(pushed_vars) end) end
                 -- Right-click context menu on the button
                 if imgui.BeginPopupContextItem('ctx_' .. chan) then
-                    -- Pops this specific channel out directly, without needing to first make it
-                    -- the main window's active tab (which is the only way the main "Pop Out"
-                    -- button can target a channel) -- this is what actually lets you pop out
-                    -- more than one channel at once: pop[] already tracks state per channel and
-                    -- the render loop already draws one window per popped channel, so the only
-                    -- real gap was a way to pop out a channel you weren't currently viewing.
+                    -- Pop out / pop in this specific channel. This right-click menu is now the only
+                    -- way to do it (the main window's Pop Out button was removed), and it can target
+                    -- ANY channel without first making it active -- which is what lets you pop out
+                    -- more than one channel at once: pop[] already tracks state per channel and the
+                    -- render loop already draws one window per popped channel.
                     if imgui.MenuItem(pop[chan].popped and 'Pop In' or 'Pop Out') then
                         pop[chan].popped = not pop[chan].popped
                         pop[chan].is_open[1] = true
@@ -4554,6 +4579,10 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                         end
                     end
                     if split.enabled then
+                        -- Layout choice (moved here from the removed Split button's own right-click
+                        -- menu) so orientation is still adjustable now that the button is gone.
+                        if imgui.MenuItem('Side by Side') then split.orientation = 'horizontal' end
+                        if imgui.MenuItem('Stacked') then split.orientation = 'vertical' end
                         if imgui.MenuItem('Swap Views') then swap_views() end
                         if imgui.MenuItem('Close Split View') then split.enabled = false end
                     end
@@ -4584,11 +4613,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             channel_button_with_menu('quest')
             channel_button_with_menu('sys')
 
-            -- RIGHT (right-aligned): Pop toggle + Split toggle + Copy + Settings. The active
-            -- channel is now shown in the window title bar instead of a "Viewing:" label here.
+            -- RIGHT (right-aligned): Notes + Settings. The Pop Out and Split buttons used to sit
+            -- here but were removed -- both are reached by right-clicking a channel tab, which does
+            -- more than the buttons did (it can pop out or split ANY channel, not just the active
+            -- one). The active channel is shown in the window title bar, not a "Viewing:" label.
             local active = chat.active_channel
-            local isPopped = pop[active].popped
-            local btnLabel = isPopped and 'Pop In' or 'Pop Out'
 
             local cur_x = 0
             pcall(function() cur_x = get_x(imgui.GetCursorPos()) end)
@@ -4607,14 +4636,6 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             local right_x_screen = (okWinPos and winPos) and (get_x(winPos) + right_x) or nil
 
             imgui.SameLine(right_x)
-            if titlebar_color_button(btnLabel) then
-                pop[active].popped = not isPopped
-                pop[active].is_open[1] = true
-                if not pop[active].popped then pop[active].alert = false end
-            end
-            imgui.SameLine()
-            draw_split_toggle_button()
-            imgui.SameLine()
             if titlebar_color_button('Notes') then chat.notes.is_open[1] = not chat.notes.is_open[1] end
             imgui.SameLine()
             if borderless_button(ICON_GEAR) then settings_ui.is_open[1] = true end
@@ -4635,6 +4656,13 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
             -- If viewing in main (not popped), clear any lingering alert for the left channel.
             if not pop[active].popped then pop[active].alert = false end
+
+            -- The tab buttons above drew at tab_font_scale (the window's scale). The message
+            -- children below are separate imgui windows, and ImGui multiplies a child's font scale
+            -- by its PARENT window's -- so leaving the window at tab_font_scale would scale the chat
+            -- text by BOTH sliders. Reset to 1.0 so each message child renders at purely its own
+            -- font_scale (applied via apply_font_scale inside the child).
+            pcall(function() imgui.SetWindowFontScale(1.0) end)
 
             -- Draw messages area(s). Window background already carries the tint; keep the
             -- children transparent so they don't double up (two stacked semi-transparent
@@ -4775,6 +4803,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
             imgui.PopStyleColor(1)
         end
+        leave_titlebar_font_scale()
         imgui.End()
         imgui.PopStyleColor(1)
         if pushed_titlebar_main > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar_main) end) end

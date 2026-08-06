@@ -28,7 +28,7 @@ Built and tested on HorizonXI; should work on any Ashita v4 server.
 
 - Colored by message type and by who's acting (you, party, pets/summons, enemies, other players)
 - Item names highlighted; per-channel colors for LS1/LS2/Party/Tell/Say
-- Split view (side-by-side or stacked) and multi-window pop-out — pop-outs restore their position after a reload
+- Split view (side-by-side or stacked) and multi-window pop-out — **right-click any tab** to pop it out into its own window or open it in a split (and to swap panes, change layout, or close the split); pop-outs restore their position after a reload
 - Optional **auto pop-out**: pop the Combat tab when you engage, the Craft tab when you craft/fish, or the Party tab when you join a party — with an optional auto-close that returns them when the activity ends (Settings → Auto Pop-Out)
 - Flashing alert for unseen messages (visual only, no sound); click a line to copy it
 - 5000 lines per channel, duplicate suppression, settings persist across sessions
