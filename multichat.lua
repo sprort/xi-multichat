@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.2.1';
+addon.version   = '2.0.0';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
