@@ -1,6 +1,6 @@
 addon.name      = 'multichat';
 addon.author    = 'Sprort';
-addon.version   = '2.2.0';
+addon.version   = '2.2.1';
 addon.desc      = 'Splits chat into one multi-tab window (LS1, LS2, Party, Tell, Say, Shout/Yell, Craft, Combat, NPC, SYS) with per-channel colors, filters, split view and pop-out windows. Read-only: reorganizes text your client already shows, never sends or alters anything.';
 addon.link      = '';
 
@@ -4090,7 +4090,7 @@ function sv.draw_window()
         -- Left sidebar of section buttons. A faint child background separates it from the
         -- content area without relying on a hard border line.
         local pushed_sidebar_bg = sv.push_color(ImGuiCol_ChildBg, {1, 1, 1, 0.03})
-        imgui.BeginChild('mc_settings_sidebar', { sv.SIDEBAR_W, 0 })
+        imgui.BeginChild('mc_settings_sidebar', { sv.SIDEBAR_W, 0 }, 0, 0)
         for i, name in ipairs(sv.categories) do
             sv.sidebar_button(name, i)
         end
@@ -4100,7 +4100,7 @@ function sv.draw_window()
         imgui.SameLine()
 
         -- Right content area for the selected section.
-        imgui.BeginChild('mc_settings_content', { 0, 0 })
+        imgui.BeginChild('mc_settings_content', { 0, 0 }, 0, 0)
         local cat = settings_ui.category
         if cat == 1 then sv.draw_general()
         elseif cat == 2 then sv.draw_colors()
@@ -4483,7 +4483,10 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 -- doesn't double up (two stacked semi-transparent layers would look more opaque
                 -- than the rest of the window).
                 imgui.PushStyleColor(ImGuiCol_ChildBg, {0,0,0,0})
-                if imgui.BeginChild(title .. 'Messages', {0, -imgui.GetFrameHeightWithSpacing() + 20}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0)) then
+                -- 3rd arg is ImGuiChildFlags (0 = no border), NOT a bool. Dear ImGui 1.90 (shipped
+                -- in Ashita v4.3.x) changed BeginChild's old `bool border` parameter to child_flags;
+                -- passing `false` now fails the binding's overload check ("no matching function call").
+                if imgui.BeginChild(title .. 'Messages', {0, -imgui.GetFrameHeightWithSpacing() + 20}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0)) then
                     apply_font_scale()
                     draw_channel_messages(channel)
                     -- A few pixels of trailing space so descenders (y, g, p, q) on the last line
@@ -4681,7 +4684,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     local bottomh = math.max(minh, availy - toph - grip)
 
                     -- TOP PANE (active)
-                    imgui.BeginChild('MessagesTop', {availx, toph}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
+                    imgui.BeginChild('MessagesTop', {availx, toph}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
                         apply_font_scale()
                         draw_channel_messages(active)
@@ -4707,7 +4710,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
                     -- BOTTOM PANE (split.right_channel)
                     local rch = split.right_channel
-                    imgui.BeginChild('MessagesBottom', {availx, bottomh}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
+                    imgui.BeginChild('MessagesBottom', {availx, bottomh}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
 						apply_font_scale()
 						-- mini header (title + copy + close view)
@@ -4738,7 +4741,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     local rightw = math.max(minw, availx - leftw - grip)
 
                     -- LEFT PANE (active)
-                    imgui.BeginChild('MessagesLeft', {leftw, availy}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
+                    imgui.BeginChild('MessagesLeft', {leftw, availy}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
                         apply_font_scale()
                         draw_channel_messages(active)
@@ -4767,7 +4770,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
                     -- RIGHT PANE (split.right_channel)
                     local rch = split.right_channel
-                    imgui.BeginChild('MessagesRight', {rightw, availy}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
+                    imgui.BeginChild('MessagesRight', {rightw, availy}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
 						apply_font_scale()
 						-- mini header (title + copy + close view)
@@ -4789,7 +4792,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     pop[rch].alert = false
                 else
                     -- Single-pane layout
-                    if (imgui.BeginChild('MessagesWindow', {0, -imgui.GetFrameHeightWithSpacing() + 20}, false, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))) then
+                    if (imgui.BeginChild('MessagesWindow', {0, -imgui.GetFrameHeightWithSpacing() + 20}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))) then
                         apply_font_scale()
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
