@@ -605,20 +605,44 @@ local function save_window_geom(key)
     end
 end
 
--- Applies the configurable text scale to whichever window/child is currently on top of the
--- ImGui window stack. Must be called separately inside each window AND each child region,
--- since ImGui does not propagate a parent window's font scale down into its children.
-local function apply_font_scale()
-    pcall(function() imgui.SetWindowFontScale(cfg.font_scale or 1.0) end)
+-- Font scaling across Ashita versions. Older Ashita exposed imgui.SetWindowFontScale (a persistent
+-- per-window multiplier). Ashita >= 4.3 ships Dear ImGui 1.92, which REMOVED that function -- font
+-- size is now a stack: imgui.PushFont(font, pixel_size) / imgui.PopFont(). chat.font_push(scale) papers
+-- over both: on new Ashita it pushes the current font re-sized by `scale` and returns a token; on
+-- old Ashita it sets the persistent scale and returns nil. Hand whatever it returns to chat.font_pop(),
+-- which pops only when something was pushed. Pushes MUST be balanced by a pop before the enclosing
+-- child/window ends. Feature-detected (not version-numbered) so it just works either way.
+-- (Hung on the `chat` table rather than top-level locals -- this file sits at Lua's 200-locals-
+-- per-chunk cap.) Detected once at load: legacy Ashita has SetWindowFontScale, new Ashita doesn't.
+chat._legacy_fontscale = (imgui.SetWindowFontScale ~= nil)
+
+function chat.font_push(scale)
+    scale = scale or 1.0
+    if chat._legacy_fontscale then
+        pcall(function() imgui.SetWindowFontScale(scale) end)
+        return nil
+    end
+    local token = nil
+    pcall(function()
+        local f = imgui.GetFont()
+        -- LegacySize is the font's base (unscaled) pixel size; fall back to the current size if the
+        -- binding doesn't expose it. Scaling off the BASE (not the current) size keeps nested pushes
+        -- from compounding.
+        local base = (f and f.LegacySize) or imgui.GetFontSize()
+        imgui.PushFont(f, base * scale)
+        token = true
+    end)
+    return token
 end
 
--- Leaves the current window's persistent font scale at the title-bar size. Call this right BEFORE
--- imgui.End() of a titled window: ImGui draws the title bar during the NEXT frame's Begin() using
--- the scale left over from this frame, so THIS (not a call after Begin) is what actually sizes the
--- title text -- letting it differ from the body scale set earlier in the frame. Costs a one-frame
--- lag while dragging the slider, imperceptible in practice.
-local function leave_titlebar_font_scale()
-    pcall(function() imgui.SetWindowFontScale(cfg.titlebar_font_scale or 1.0) end)
+function chat.font_pop(token)
+    if token then pcall(function() imgui.PopFont() end) end
+end
+
+-- Back-compat shim: the message children call this with no argument to mean "the chat font scale".
+-- Returns a token to pass to chat.font_pop().
+local function apply_font_scale()
+    return chat.font_push(cfg.font_scale or 1.0)
 end
 
 -- Theme accent used for buttons, headers, checkmarks, sliders, and the settings swatch. The window
@@ -1568,8 +1592,13 @@ function chat.notes_draw()
     local okBg = pcall(function() imgui.PushStyleColor(ImGuiCol_WindowBg, nc.background) end)
     pcall(function() imgui.SetNextWindowSize({ 360, 320 }, ImGuiCond_FirstUseEver) end)
     local flags = cfg.notes_show_collapse_arrow and 0 or (ImGuiWindowFlags_NoCollapse or 0)
-    if imgui.Begin('MultiChat - Notes###MultiChatNotes', chat.notes.is_open, flags) then
-        apply_font_scale()
+    -- The title bar is drawn during Begin(), so push the title-bar font scale BEFORE Begin (new
+    -- Ashita's PushFont model has no persistent per-window scale to lean on), then pop it right after.
+    local tb_font = chat.font_push(cfg.titlebar_font_scale or 1.0)
+    local notes_open = imgui.Begin('MultiChat - Notes###MultiChatNotes', chat.notes.is_open, flags)
+    chat.font_pop(tb_font)
+    if notes_open then
+        local body_font = apply_font_scale()
         -- Fill the window. GetContentRegionAvail returns TWO numbers (x, y) in this binding, not a
         -- single ImVec2 -- capture both (floored to ints, which the size argument wants).
         local w, h = 300, 240
@@ -1606,8 +1635,8 @@ function chat.notes_draw()
         if pushed_var > 0 then pcall(function() imgui.PopStyleVar(pushed_var) end) end
         if pushed_field > 0 then pcall(function() imgui.PopStyleColor(pushed_field) end) end
         if ok and changed then chat.notes.dirty = true end
+        chat.font_pop(body_font)
     end
-    leave_titlebar_font_scale()
     imgui.End()
     if okBg then pcall(function() imgui.PopStyleColor(1) end) end
     if pushed_tb > 0 then pcall(function() imgui.PopStyleColor(pushed_tb) end) end
@@ -4452,24 +4481,23 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             apply_window_bounds(channel)
             local pushed_titlebar = push_titlebar_color()
             imgui.PushStyleColor(ImGuiCol_WindowBg, chat.window_bg(channel))
-            if imgui.Begin(title, state.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse) then
-                -- Keep this window's own scale neutral (1.0): its message child multiplies its font
-                -- scale by this parent's, so a non-1.0 value here would scale the chat text by more
-                -- than font_scale alone (see the same fix on the main window). The title bar drew
-                -- during Begin at titlebar_font_scale (left over from leave_titlebar_font_scale last
-                -- frame); the EXP overlay below sets its own scale explicitly.
-                pcall(function() imgui.SetWindowFontScale(1.0) end)
+            -- Title bar is drawn during Begin(): push the title-bar font scale before Begin, pop it
+            -- right after (new Ashita has no persistent per-window scale). With PushFont/PopFont a
+            -- child's size is absolute, so there's no parent-scale bleed into the message child.
+            local pop_tb_font = chat.font_push(cfg.titlebar_font_scale or 1.0)
+            local pop_open = imgui.Begin(title, state.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse)
+            chat.font_pop(pop_tb_font)
+            if pop_open then
                 save_window_geom(channel)
                 -- The popped-out Combat window shows readouts in its title bar (like the battery on the
-                -- main window): "Last EXP:" centered, and the rolling EXP/hour rate right-aligned.
-                -- Sized by titlebar_font_scale (title-bar furniture), then restored to neutral for
-                -- the message child.
+                -- main window): "Last EXP:" centered, and the rolling EXP/hour rate right-aligned --
+                -- drawn at the title-bar font scale.
                 if channel == 'combat' then
-                    pcall(function() imgui.SetWindowFontScale(cfg.titlebar_font_scale or 1.0) end)
+                    local exp_font = chat.font_push(cfg.titlebar_font_scale or 1.0)
                     chat.titlebar_text('Last EXP: ' .. (last_exp_gained and tostring(last_exp_gained) or '-'), EXP_COLOR, 'center')
                     local rate = chat.exp_per_hour_display()
                     chat.titlebar_text('EXP/h: ' .. (rate and tostring(rate) or '-'), EXP_COLOR, 'right')
-                    pcall(function() imgui.SetWindowFontScale(1.0) end)
+                    chat.font_pop(exp_font)
                 end
                 -- ImGuiFocusedFlags_ChildWindows is required here -- the message area below is
                 -- a separate BeginChild (a child window with its own focus state), and without
@@ -4487,16 +4515,16 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 -- in Ashita v4.3.x) changed BeginChild's old `bool border` parameter to child_flags;
                 -- passing `false` now fails the binding's overload check ("no matching function call").
                 if imgui.BeginChild(title .. 'Messages', {0, -imgui.GetFrameHeightWithSpacing() + 20}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0)) then
-                    apply_font_scale()
+                    local body_font = apply_font_scale()
                     draw_channel_messages(channel)
                     -- A few pixels of trailing space so descenders (y, g, p, q) on the last line
                     -- aren't clipped by the child's bottom edge when scrolled all the way down.
                     pcall(function() imgui.Dummy({0, 4}) end)
                     chat.autoscroll('pop_' .. channel)
+                    chat.font_pop(body_font)
                 end
                 imgui.EndChild(); imgui.PopStyleColor(1)
             end
-            leave_titlebar_font_scale()
             imgui.End(); imgui.PopStyleColor(1)
             if pushed_titlebar > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar) end) end
             if not state.is_open[1] then state.popped=false; state.is_open[1]=true end
@@ -4512,20 +4540,18 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         -- text changes with the active channel -- without it, changing the title string would
         -- make ImGui treat this as a brand-new window each time (losing position/size/focus).
         local main_title = 'MultiChat - ' .. (channelLabels[chat.active_channel] or chat.active_channel) .. chat.title_suffix(chat.active_channel) .. '###MultiChatMain'
-        if (imgui.Begin(main_title, chat.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse)) then
-            -- The main window's own scale drives the channel-tab / Notes buttons (its only directly
-            -- drawn text). The message area gets its own scale via apply_font_scale() inside each
-            -- message child below (a child is a separate imgui window, so its font scale is set
-            -- independently), which is why the two sliders -- tab_font_scale vs font_scale -- can
-            -- differ. SetWindowFontScale persists per-window, so it's re-set here every frame.
-            pcall(function() imgui.SetWindowFontScale(cfg.tab_font_scale or 1.0) end)
+        -- Title bar is drawn during Begin(): push the title-bar font scale before Begin, pop right
+        -- after (new Ashita has no persistent per-window scale). The channel-tab / Notes buttons get
+        -- tab_font_scale further below, and each message child pushes font_scale itself.
+        local main_tb_font = chat.font_push(cfg.titlebar_font_scale or 1.0)
+        local main_open = imgui.Begin(main_title, chat.is_open, cfg.show_collapse_arrow and 0 or ImGuiWindowFlags_NoCollapse)
+        chat.font_pop(main_tb_font)
+        if main_open then
             save_window_geom('main')
-            -- Battery overlay is title-bar furniture, so size it by titlebar_font_scale (it draws
-            -- via GetFontSize, which reads the window's current scale), then restore tab_font_scale
-            -- for the channel buttons below.
-            pcall(function() imgui.SetWindowFontScale(cfg.titlebar_font_scale or 1.0) end)
+            -- Battery overlay is title-bar furniture -- draw it at the title-bar font scale.
+            local bat_font = chat.font_push(cfg.titlebar_font_scale or 1.0)
             pcall(chat.battery_draw_titlebar)   -- host battery % in the title bar, right-aligned (opt-in)
-            pcall(function() imgui.SetWindowFontScale(cfg.tab_font_scale or 1.0) end)
+            chat.font_pop(bat_font)
 
             -- Measured before anything else is drawn, so this is the window's true full content
             -- width — not "whatever's left after the channel buttons," which is what
@@ -4605,6 +4631,10 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 end
             end
 
+            -- The channel tabs, the right-side Notes/Settings cluster, and the separator below all
+            -- draw at tab_font_scale. Popped back to the base font before the message children.
+            local tab_font = chat.font_push(cfg.tab_font_scale or 1.0)
+
             channel_button_with_menu('linkshell')
             if ls2_shown then channel_button_with_menu('linkshell2') end
             channel_button_with_menu('party')
@@ -4660,12 +4690,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             -- If viewing in main (not popped), clear any lingering alert for the left channel.
             if not pop[active].popped then pop[active].alert = false end
 
-            -- The tab buttons above drew at tab_font_scale (the window's scale). The message
-            -- children below are separate imgui windows, and ImGui multiplies a child's font scale
-            -- by its PARENT window's -- so leaving the window at tab_font_scale would scale the chat
-            -- text by BOTH sliders. Reset to 1.0 so each message child renders at purely its own
-            -- font_scale (applied via apply_font_scale inside the child).
-            pcall(function() imgui.SetWindowFontScale(1.0) end)
+            -- End the tab-font scope opened before the channel buttons; the message children below
+            -- push their own font_scale. (With PushFont a child's size is absolute -- no parent bleed.)
+            chat.font_pop(tab_font)
 
             -- Draw messages area(s). Window background already carries the tint; keep the
             -- children transparent so they don't double up (two stacked semi-transparent
@@ -4686,10 +4713,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     -- TOP PANE (active)
                     imgui.BeginChild('MessagesTop', {availx, toph}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
-                        apply_font_scale()
+                        local body_font = apply_font_scale()
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         chat.autoscroll('main')   -- single-pane, split top, and split left never coexist
+                        chat.font_pop(body_font)
                     end
                     imgui.EndChild()
 
@@ -4712,7 +4740,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     local rch = split.right_channel
                     imgui.BeginChild('MessagesBottom', {availx, bottomh}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
-						apply_font_scale()
+						local body_font = apply_font_scale()
 						-- mini header (title + copy + close view)
 						imgui.TextColored(channelColors[rch] or {1,1,1,1}, channelLabels[rch] or rch)
 						imgui.SameLine()
@@ -4725,6 +4753,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                         draw_channel_messages(rch)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         chat.autoscroll('split_right')   -- split bottom + right never coexist
+                        chat.font_pop(body_font)
                     end
                     imgui.EndChild()
 
@@ -4743,10 +4772,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     -- LEFT PANE (active)
                     imgui.BeginChild('MessagesLeft', {leftw, availy}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
-                        apply_font_scale()
+                        local body_font = apply_font_scale()
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         chat.autoscroll('main')   -- single-pane, split top, and split left never coexist
+                        chat.font_pop(body_font)
                     end
                     imgui.EndChild()
 
@@ -4772,7 +4802,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                     local rch = split.right_channel
                     imgui.BeginChild('MessagesRight', {rightw, availy}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))
                     do
-						apply_font_scale()
+						local body_font = apply_font_scale()
 						-- mini header (title + copy + close view)
 						imgui.TextColored(channelColors[rch] or {1,1,1,1}, channelLabels[rch] or rch)
 						imgui.SameLine()
@@ -4785,6 +4815,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                         draw_channel_messages(rch)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         chat.autoscroll('split_right')   -- split bottom + right never coexist
+                        chat.font_pop(body_font)
                     end
                     imgui.EndChild()
 
@@ -4793,10 +4824,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
                 else
                     -- Single-pane layout
                     if (imgui.BeginChild('MessagesWindow', {0, -imgui.GetFrameHeightWithSpacing() + 20}, 0, (ImGuiWindowFlags_AlwaysVerticalScrollbar or 0))) then
-                        apply_font_scale()
+                        local body_font = apply_font_scale()
                         draw_channel_messages(active)
                         pcall(function() imgui.Dummy({0, 4}) end)
                         chat.autoscroll('main')   -- single-pane, split top, and split left never coexist
+                        chat.font_pop(body_font)
                     end
                     imgui.EndChild()
                 end
@@ -4806,7 +4838,6 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
             imgui.PopStyleColor(1)
         end
-        leave_titlebar_font_scale()
         imgui.End()
         imgui.PopStyleColor(1)
         if pushed_titlebar_main > 0 then pcall(function() imgui.PopStyleColor(pushed_titlebar_main) end) end
